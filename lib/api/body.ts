@@ -1,10 +1,15 @@
+import { MAX_PAGES } from "./limits";
+
 export type BodyKind = "html" | "json" | "text" | "empty";
 
 export type ResponseSummary = {
   contentType: string;
   bodyKind: BodyKind;
   topLevelKeys: string[];
+  /** Rows inside `results.data` (or another recognized list). Never the wrapper object. */
   recordCount: number | null;
+  /** True when `next_cursor` is a non-empty string. The cursor value is not reported. */
+  hasNextCursor: boolean;
   detail: string;
 };
 
@@ -46,7 +51,7 @@ export class UnrecognizedCollectionError extends Error {
 }
 
 export function emptySummary(detail = ""): ResponseSummary {
-  return { contentType: "", bodyKind: "empty", topLevelKeys: [], recordCount: null, detail };
+  return { contentType: "", bodyKind: "empty", topLevelKeys: [], recordCount: null, hasNextCursor: false, detail };
 }
 
 export function formatApiError(path: string, status: number, summary: ResponseSummary): string {
@@ -72,7 +77,7 @@ export function inspectResponse(
   const mime = safeContentType(contentType);
   const parsed = tryParseJson(raw);
   if (!raw.trim()) {
-    return { summary: { contentType: mime, bodyKind: "empty", topLevelKeys: [], recordCount: null, detail: "" }, payload: null };
+    return { summary: { contentType: mime, bodyKind: "empty", topLevelKeys: [], recordCount: null, hasNextCursor: false, detail: "" }, payload: null };
   }
   if (parsed.ok) {
     const payload = parsed.value;
@@ -83,6 +88,7 @@ export function inspectResponse(
       bodyKind: "json",
       topLevelKeys,
       recordCount: collection ? collection.items.length : null,
+      hasNextCursor: hasCursor(payload),
       detail: jsonDetail(payload, topLevelKeys, Boolean(collection), secrets),
     };
     return { summary, payload };
@@ -94,6 +100,7 @@ export function inspectResponse(
         bodyKind: "html",
         topLevelKeys: [],
         recordCount: null,
+        hasNextCursor: false,
         detail: htmlDetail(raw, secrets),
       },
       payload: null,
@@ -105,6 +112,7 @@ export function inspectResponse(
       bodyKind: "text",
       topLevelKeys: [],
       recordCount: null,
+      hasNextCursor: false,
       detail: sanitizeSnippet(raw, secrets),
     },
     payload: null,
@@ -128,7 +136,7 @@ export async function collectAll<T>(load: (query: PageQuery) => Promise<unknown>
   const items: T[] = [];
   let query: PageQuery = {};
   const seen = new Set<string>();
-  for (let page = 0; page < 40; page += 1) {
+  for (let page = 0; page < MAX_PAGES; page += 1) {
     const key = `${query.page ?? ""}:${query.cursor ?? ""}`;
     if (seen.has(key)) break;
     seen.add(key);
@@ -192,6 +200,21 @@ function htmlMarkers(raw: string): string[] {
   if (/csrf/i.test(sample)) markers.push("csrf");
   if (/\blogin\b|sign in/i.test(sample)) markers.push("login");
   return markers;
+}
+
+/** True only when a page object carries a non-empty `next_cursor`. Null and missing cursors are false. */
+function hasCursor(payload: unknown): boolean {
+  if (!isRecord(payload)) return false;
+  if (isCursorValue(payload.next_cursor)) return true;
+  for (const key of ["results", "data", "orgs", "projects", "items"]) {
+    const value = payload[key];
+    if (isRecord(value) && isCursorValue(value.next_cursor)) return true;
+  }
+  return false;
+}
+
+function isCursorValue(value: unknown): boolean {
+  return typeof value === "string" && isCursor(value);
 }
 
 function nextQuery(record: Record<string, unknown>): PageQuery | null {

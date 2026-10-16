@@ -17,7 +17,9 @@ import {
   type AuthModeName,
   type ConnectionReport,
 } from "./session";
+import { PAGE_SIZE, PROJECT_FETCH_CONCURRENCY } from "./limits";
 import type { ApiOrg, ApiProject } from "./types";
+import { clearLiveInputsCache } from "../data/live-cache";
 
 export { SubhubApiError };
 
@@ -63,6 +65,7 @@ export async function checkApiConnection(): Promise<ConnectionReport> {
 export function resetApiSession(): void {
   session = null;
   sessionFingerprint = "";
+  clearLiveInputsCache();
 }
 
 function configuredSecrets(): string[] {
@@ -96,7 +99,7 @@ export async function fetchAllPages<T>(
   const last: { summary?: ResponseSummary; status?: number } = {};
   try {
     return await collectAll<T>(async (query: PageQuery) => {
-      const read = await readPayload(path, { ...params, limit: 50, cursor: query.cursor, page: query.page });
+      const read = await readPayload(path, { ...params, limit: PAGE_SIZE, cursor: query.cursor, page: query.page });
       last.summary = read.summary;
       last.status = read.status;
       return read.payload;
@@ -129,9 +132,54 @@ export async function fetchOrgs(): Promise<ApiOrg[]> {
 }
 
 export async function fetchProjectsByOrg(orgIds: string[]): Promise<Record<string, ApiProject[]>> {
-  const rows = await mapPool(orgIds, 3, async (orgId) => {
+  if (orgIds.length === 0) return {};
+  try {
+    const projects = await fetchAllPages<ApiProject>("/api/v1/superadmin/projects");
+    if (projects.length > 0) {
+      const grouped = groupProjects(orgIds, projects);
+      if (grouped) return grouped;
+    }
+  } catch (error) {
+    if (!shouldFetchProjectsPerOrg(error)) throw error;
+  }
+  return fetchProjectsPerOrg(orgIds);
+}
+
+async function fetchProjectsPerOrg(orgIds: string[]): Promise<Record<string, ApiProject[]>> {
+  const rows = await mapPool(orgIds, PROJECT_FETCH_CONCURRENCY, async (orgId) => {
     const projects = await fetchAllPages<ApiProject>("/api/v1/superadmin/projects", { org_id: orgId });
     return [orgId, projects] as const;
   });
   return Object.fromEntries(rows);
+}
+
+function groupProjects(orgIds: string[], projects: ApiProject[]): Record<string, ApiProject[]> | null {
+  const grouped: Record<string, ApiProject[]> = Object.fromEntries(orgIds.map((id) => [id, [] as ApiProject[]]));
+  let tagged = 0;
+  for (const project of projects) {
+    const orgId = projectOrgId(project);
+    if (!orgId) continue;
+    tagged += 1;
+    if (!grouped[orgId]) grouped[orgId] = [];
+    grouped[orgId].push(project);
+  }
+  return tagged > 0 ? grouped : null;
+}
+
+function projectOrgId(project: ApiProject): string | null {
+  const record = project as ApiProject & {
+    org_id?: string | number | null;
+    organization_id?: string | number | null;
+    org?: { id?: string | number | null } | null;
+  };
+  const direct = record.org_id ?? record.organization_id ?? record.org?.id;
+  if (typeof direct === "string" || typeof direct === "number") return String(direct);
+  return null;
+}
+
+function shouldFetchProjectsPerOrg(error: unknown): boolean {
+  if (!(error instanceof SubhubApiError)) return false;
+  if (error.status === 401 || error.status === 403) return false;
+  if (error.bodyKind === "html") return false;
+  return true;
 }

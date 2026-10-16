@@ -8,7 +8,10 @@ export function healthPayload(report: ConnectionReport): Record<string, unknown>
   if (report.contentType) payload.contentType = report.contentType;
   if (report.bodyKind) payload.bodyKind = report.bodyKind;
   if (report.topLevelKeys) payload.topLevelKeys = report.topLevelKeys;
-  if (report.bodyKind) payload.recordCount = report.recordCount ?? null;
+  if (report.bodyKind) {
+    payload.recordCount = report.recordCount ?? null;
+    payload.hasNextCursor = report.hasNextCursor === true;
+  }
   if (report.detail) payload.detail = report.detail;
   if (report.loginPath) payload.loginPath = report.loginPath;
   if (report.loginAttempts && report.loginAttempts.length > 0) payload.loginAttempts = report.loginAttempts;

@@ -1,18 +1,29 @@
-import { Shell } from "@/components/shell";
-import { loadPortfolio } from "@/lib/data/load";
+import { Suspense } from "react";
+import { AlertNav, AsOfLine, ConnectionBanner } from "@/components/portfolio-chrome";
+import { Shell, ShellNavFallback } from "@/components/shell";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-export default async function DashLayout({ children }: { children: React.ReactNode }) {
-  const portfolio = await loadPortfolio();
+export default function DashLayout({ children }: { children: React.ReactNode }) {
   return (
     <Shell
-      mode={portfolio.mode}
-      notice={portfolio.notice}
-      alertCount={portfolio.alerts.length}
       authRequired={Boolean(process.env.DASHBOARD_PASSWORD)}
-      asOf={portfolio.asOf}
+      nav={
+        <Suspense fallback={<ShellNavFallback />}>
+          <AlertNav />
+        </Suspense>
+      }
+      banner={
+        <Suspense fallback={<p>Loading the portfolio…</p>}>
+          <ConnectionBanner />
+        </Suspense>
+      }
+      meta={
+        <Suspense fallback={null}>
+          <AsOfLine />
+        </Suspense>
+      }
     >
       {children}
     </Shell>
