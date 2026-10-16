@@ -6,7 +6,8 @@
 export const PAGE_SIZE = 50;
 export const MAX_PAGES = 40;
 export const REQUEST_TIMEOUT_MS = 15_000;
-export const PROJECT_FETCH_CONCURRENCY = 8;
-/** In-process portfolio cache. Next.js revalidate is a little longer so a new instance can reuse it. */
-export const PORTFOLIO_TTL_MS = 12 * 60 * 1000;
-export const PORTFOLIO_REVALIDATE_SECONDS = 900;
+/** In-process portfolio cache. Next.js revalidate matches it. A failed refresh keeps the last snapshot. */
+export const PORTFOLIO_TTL_MS = 30 * 60 * 1000;
+export const PORTFOLIO_REVALIDATE_SECONDS = 1800;
+/** After a failed refresh, wait this long before trying the API again. */
+export const STALE_RETRY_MS = 60_000;

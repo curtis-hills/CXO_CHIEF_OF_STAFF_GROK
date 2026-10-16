@@ -85,6 +85,8 @@ export type Account = {
   waitingReason: string | null;
   waitingSource: DateSource;
   projects: ProjectView[];
+  /** False when the org list loaded and the project list did not. */
+  projectsAvailable: boolean;
   checklist: ChecklistItem[];
   checklistTracked: boolean;
   pace: PaceEvaluation | null;

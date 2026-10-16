@@ -14,17 +14,22 @@ import {
   AuthRejectedError,
   connectionIntent,
   readApiAuthConfig,
+  resetProcessMemory,
   type AuthModeName,
   type ConnectionReport,
 } from "./session";
-import { PAGE_SIZE, PROJECT_FETCH_CONCURRENCY } from "./limits";
+import { PAGE_SIZE } from "./limits";
 import type { ApiOrg, ApiProject } from "./types";
 import { clearLiveInputsCache } from "../data/live-cache";
 
 export { SubhubApiError };
 
-let session: ApiSession | null = null;
-let sessionFingerprint = "";
+type SessionSlot = { session: ApiSession | null; fingerprint: string };
+
+const sessionSlot: SessionSlot = ((globalThis as typeof globalThis & { __cxmApiSession?: SessionSlot }).__cxmApiSession ??= {
+  session: null,
+  fingerprint: "",
+});
 
 function currentSession(): ApiSession {
   const config = readApiAuthConfig(process.env);
@@ -41,11 +46,11 @@ function currentSession(): ApiSession {
     config.username,
     config.password,
   ].join("\u0000");
-  if (!session || sessionFingerprint !== fingerprint) {
-    session = new ApiSession(config, fetch);
-    sessionFingerprint = fingerprint;
+  if (!sessionSlot.session || sessionSlot.fingerprint !== fingerprint) {
+    sessionSlot.session = new ApiSession(config, fetch);
+    sessionSlot.fingerprint = fingerprint;
   }
-  return session;
+  return sessionSlot.session;
 }
 
 export function getApiConfig(): { baseUrl: string; live: boolean; mode: AuthModeName | "auto" | "demo" } {
@@ -63,8 +68,9 @@ export async function checkApiConnection(): Promise<ConnectionReport> {
 }
 
 export function resetApiSession(): void {
-  session = null;
-  sessionFingerprint = "";
+  sessionSlot.session = null;
+  sessionSlot.fingerprint = "";
+  resetProcessMemory();
   clearLiveInputsCache();
 }
 
@@ -112,21 +118,6 @@ export async function fetchAllPages<T>(
   }
 }
 
-async function mapPool<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await fn(items[index]!, index);
-    }
-  }
-  const workers = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workers }, () => worker()));
-  return results;
-}
-
 export async function fetchOrgs(): Promise<ApiOrg[]> {
   return fetchAllPages<ApiOrg>("/api/v1/superadmin/orgs");
 }
@@ -145,12 +136,13 @@ export async function fetchProjectsByOrg(orgIds: string[]): Promise<Record<strin
   return fetchProjectsPerOrg(orgIds);
 }
 
+/** One org at a time. A parallel fan-out trips the Laravel throttle. */
 async function fetchProjectsPerOrg(orgIds: string[]): Promise<Record<string, ApiProject[]>> {
-  const rows = await mapPool(orgIds, PROJECT_FETCH_CONCURRENCY, async (orgId) => {
-    const projects = await fetchAllPages<ApiProject>("/api/v1/superadmin/projects", { org_id: orgId });
-    return [orgId, projects] as const;
-  });
-  return Object.fromEntries(rows);
+  const grouped: Record<string, ApiProject[]> = {};
+  for (const orgId of orgIds) {
+    grouped[orgId] = await fetchAllPages<ApiProject>("/api/v1/superadmin/projects", { org_id: orgId });
+  }
+  return grouped;
 }
 
 function groupProjects(orgIds: string[], projects: ApiProject[]): Record<string, ApiProject[]> | null {
@@ -179,7 +171,7 @@ function projectOrgId(project: ApiProject): string | null {
 
 function shouldFetchProjectsPerOrg(error: unknown): boolean {
   if (!(error instanceof SubhubApiError)) return false;
-  if (error.status === 401 || error.status === 403) return false;
+  if (error.status === 401 || error.status === 403 || error.status === 429) return false;
   if (error.bodyKind === "html") return false;
   return true;
 }

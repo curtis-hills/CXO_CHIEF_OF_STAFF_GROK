@@ -97,6 +97,8 @@ export function assemblePortfolio(input: {
   asOf: string;
   orgs: ApiOrg[];
   projectsByOrg: Record<string, ApiProject[]>;
+  /** When false, orgs are real and project counts must not be treated as zero. */
+  projectsAvailable?: boolean;
   proxies: Record<string, ProxyProfile>;
   overrides: Record<string, LifecycleOverride>;
 }): { accounts: Account[]; alerts: Alert[] } {
@@ -111,6 +113,7 @@ function toAccount(
     mode: "mock" | "live";
     asOf: string;
     projectsByOrg: Record<string, ApiProject[]>;
+    projectsAvailable?: boolean;
     proxies: Record<string, ProxyProfile>;
     overrides: Record<string, LifecycleOverride>;
   },
@@ -182,9 +185,11 @@ function toAccount(
     }
   }
 
+  const projectsAvailable = input.projectsAvailable !== false;
   const launchDay = launchedAt.iso ? utcDayNumber(launchedAt.iso) : null;
   const asOfDay = utcDayNumber(input.asOf);
-  const projects: ProjectView[] = (input.projectsByOrg[id] ?? []).map((project) => {
+  const projects: ProjectView[] = projectsAvailable
+    ? (input.projectsByOrg[id] ?? []).map((project) => {
     const createdAt = project.created_at ?? input.asOf;
     const isTest = project.is_test === true;
     const deleted = Boolean(project.deleted_at);
@@ -205,11 +210,12 @@ function toAccount(
       live,
       testFlagSource,
     };
-  });
+  })
+    : [];
   projects.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 
   const pace =
-    stage === "launched" && launchedAt.iso
+    projectsAvailable && stage === "launched" && launchedAt.iso
       ? evaluatePace({
           launchedAt: launchedAt.iso,
           asOf: input.asOf,
@@ -231,8 +237,9 @@ function toAccount(
   });
 
   const liveDates = projects.filter((project) => project.live).map((project) => project.createdAt);
-  const health =
-    stage === "launched" && !launchedAt.iso
+  const health = !projectsAvailable
+    ? unscoredHealth("Projects could not be loaded, so pace and health are not scored from volume.")
+    : stage === "launched" && !launchedAt.iso
       ? unscoredHealth("Launched date is missing, so pace and health are not scored.")
       : evaluateHealth({
           launched: stage === "launched",
@@ -299,6 +306,7 @@ function toAccount(
     waitingReason,
     waitingSource,
     projects,
+    projectsAvailable,
     checklist,
     checklistTracked,
     pace,

@@ -11,10 +11,17 @@ import { readOverrides } from "./overrides";
 
 export type Portfolio = {
   mode: "mock" | "live";
+  /** Clock used for pace and stage math. This is the current request time. */
   asOf: string;
+  /** When the org and project snapshot was read. Null on demo data. */
+  dataAsOf: string | null;
+  projectsAvailable: boolean;
   accounts: Account[];
   alerts: Alert[];
-  /** Set when live credentials exist but the API response could not be used. */
+  /**
+   * Demo failure, a stale snapshot, or projects that could not be loaded.
+   * Live orgs are never replaced by demo accounts while a snapshot exists.
+   */
   notice: string | null;
 };
 
@@ -28,7 +35,7 @@ function demoPortfolio(asOf: string, overrides: ReturnType<typeof readOverrides>
     proxies: mock.proxies,
     overrides,
   });
-  return { mode: "mock", asOf, notice, ...assembled };
+  return { mode: "mock", asOf, dataAsOf: null, projectsAvailable: true, notice, ...assembled };
 }
 
 export async function readPortfolio(): Promise<Portfolio> {
@@ -38,16 +45,24 @@ export async function readPortfolio(): Promise<Portfolio> {
     const config = getApiConfig();
     if (!config.live) return demoPortfolio(asOf, overrides, null);
 
-    const { orgs, projectsByOrg } = await getLiveInputs();
+    const live = await getLiveInputs();
     const assembled = assemblePortfolio({
       mode: "live",
       asOf,
-      orgs,
-      projectsByOrg,
+      orgs: live.orgs,
+      projectsByOrg: live.projectsByOrg,
+      projectsAvailable: live.projectsAvailable,
       proxies: {},
       overrides,
     });
-    return { mode: "live", asOf, notice: null, ...assembled };
+    return {
+      mode: "live",
+      asOf,
+      dataAsOf: live.fetchedAt,
+      projectsAvailable: live.projectsAvailable,
+      notice: live.warning,
+      ...assembled,
+    };
   } catch (error) {
     const secrets = [process.env.SUBHUB_API_PASSWORD, process.env.SUBHUB_API_KEY].filter(
       (value): value is string => Boolean(value && value.length >= 3),

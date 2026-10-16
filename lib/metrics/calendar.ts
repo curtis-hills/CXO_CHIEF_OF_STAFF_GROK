@@ -78,3 +78,14 @@ export function formatUtcWeekday(iso: string): string {
     year: "numeric",
   }).format(new Date(iso));
 }
+
+export function formatUtcTimestamp(iso: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(new Date(iso));
+}

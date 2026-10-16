@@ -15,5 +15,6 @@ export function healthPayload(report: ConnectionReport): Record<string, unknown>
   if (report.detail) payload.detail = report.detail;
   if (report.loginPath) payload.loginPath = report.loginPath;
   if (report.loginAttempts && report.loginAttempts.length > 0) payload.loginAttempts = report.loginAttempts;
+  if (report.rateLimit) payload.rateLimit = report.rateLimit;
   return payload;
 }

@@ -6,6 +6,7 @@
 
 import { inspectResponse, redactSecrets } from "./body";
 import { PAGE_SIZE, REQUEST_TIMEOUT_MS } from "./limits";
+import { MAX_RATE_LIMIT_RETRIES, readRateLimitHeaders, retryDelayMs, type RateLimitSnapshot } from "./rate-limit";
 
 export { redactSecrets };
 
@@ -44,8 +45,16 @@ export type LoginAttemptReport = {
   topLevelKeys: string[];
 };
 
+export type RateLimitReport = {
+  retryAfter?: string;
+  limit?: string;
+  remaining?: string;
+  reset?: string;
+  status: number;
+};
+
 export type ConnectionReport = {
-  status: "demo" | "connected" | "auth failed" | "unexpected body";
+  status: "demo" | "connected" | "auth failed" | "unexpected body" | "rate limited";
   mode?: AuthModeName;
   httpStatus: number;
   upstreamStatus?: number;
@@ -55,6 +64,8 @@ export type ConnectionReport = {
   recordCount?: number | null;
   /** Whether the orgs page included a non-empty next_cursor. The cursor itself is omitted. */
   hasNextCursor?: boolean;
+  /** Latest Retry-After / X-RateLimit-* values. Never includes a token. */
+  rateLimit?: RateLimitReport;
   detail?: string;
   /** Login path that returned a token. */
   loginPath?: string;
@@ -185,6 +196,62 @@ export function basicAuthorization(username: string, password: string): string {
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+type ProcessLogin = { key: string; promise: Promise<string> };
+
+type ProcessLoginMeta = { key: string; path: string; attempts: LoginAttemptReport[] };
+
+type ProcessMemory = {
+  token: { key: string; value: string; expiresAt: number } | null;
+  login: ProcessLogin | null;
+  loginMeta: ProcessLoginMeta | null;
+  throttle: RateLimitSnapshot | null;
+  rateLimit: RateLimitSnapshot | null;
+};
+
+const EMPTY_PROCESS_MEMORY = (): ProcessMemory => ({
+  token: null,
+  login: null,
+  loginMeta: null,
+  throttle: null,
+  rateLimit: null,
+});
+
+/**
+ * Next can compile the page and /api/health into separate module copies, so a
+ * module-level session is not enough. The object lives on both globalThis and
+ * process; whichever realm the other bundle can see, it finds the same record.
+ */
+function sharedProcessMemory(): ProcessMemory {
+  const holder = globalThis as typeof globalThis & { __cxmApiMemory?: ProcessMemory };
+  const proc = process as typeof process & { __cxmApiMemory?: ProcessMemory };
+  const existing = holder.__cxmApiMemory ?? proc.__cxmApiMemory;
+  if (existing) {
+    holder.__cxmApiMemory = existing;
+    proc.__cxmApiMemory = existing;
+    return existing;
+  }
+  const created = EMPTY_PROCESS_MEMORY();
+  holder.__cxmApiMemory = created;
+  proc.__cxmApiMemory = created;
+  return created;
+}
+
+const processMemory: ProcessMemory = sharedProcessMemory();
+
+/** Drops the shared token, in-flight login, and throttle snapshot. */
+export function resetProcessMemory(): void {
+  const fresh = EMPTY_PROCESS_MEMORY();
+  processMemory.token = fresh.token;
+  processMemory.login = fresh.login;
+  processMemory.loginMeta = fresh.loginMeta;
+  processMemory.throttle = fresh.throttle;
+  processMemory.rateLimit = fresh.rateLimit;
+}
+
+function sessionKey(config: ApiAuthConfig): string {
+  return [config.baseUrl, config.mode, config.username, config.apiKey].join("\u0000");
+}
+
 export class ApiSession {
   private token: string | null = null;
   private tokenExpiresAt: number | null = null;
@@ -193,6 +260,9 @@ export class ApiSession {
   private generation = 0;
   private loginPathUsed: string | null = null;
   private loginAttempts: LoginAttemptReport[] = [];
+  private lastRateLimit: RateLimitSnapshot | null = null;
+  /** Kept even when a later 200 also sends X-RateLimit-* headers. */
+  private lastThrottle: RateLimitSnapshot | null = null;
 
   constructor(
     private readonly config: ApiAuthConfig,
@@ -223,7 +293,9 @@ export class ApiSession {
         hasNextCursor: summary.hasNextCursor,
         detail: summary.detail,
         ...this.loginMeta(),
+        ...this.rateLimitMeta(),
       };
+      if (response.status === 429) return { status: "rate limited", httpStatus: 503, ...diagnostic };
       if (response.status === 401 || response.status === 403) return { status: "auth failed", httpStatus: 401, ...diagnostic };
       if (!response.ok) return { status: "auth failed", httpStatus: 503, ...diagnostic };
       if (summary.bodyKind === "json" && summary.recordCount !== null) return { status: "connected", httpStatus: 200, ...diagnostic };
@@ -236,11 +308,28 @@ export class ApiSession {
     }
   }
 
+  private rateLimitMeta(): { rateLimit?: RateLimitReport } {
+    const snap = processMemory.throttle ?? this.lastThrottle ?? processMemory.rateLimit ?? this.lastRateLimit;
+    if (!snap) return {};
+    const rateLimit: RateLimitReport = { status: snap.status };
+    if (snap.retryAfter) rateLimit.retryAfter = snap.retryAfter;
+    if (snap.limit) rateLimit.limit = snap.limit;
+    if (snap.remaining) rateLimit.remaining = snap.remaining;
+    if (snap.reset) rateLimit.reset = snap.reset;
+    return { rateLimit };
+  }
+
   private loginMeta(): { loginPath?: string; loginAttempts?: LoginAttemptReport[] } {
-    if (this.loginAttempts.length === 0) return {};
+    const shared =
+      this.loginAttempts.length === 0 && processMemory.loginMeta?.key === sessionKey(this.config)
+        ? processMemory.loginMeta
+        : null;
+    const attempts = this.loginAttempts.length > 0 ? this.loginAttempts : (shared?.attempts ?? []);
+    const path = this.loginAttempts.length > 0 ? this.loginPathUsed : (shared?.path ?? null);
+    if (attempts.length === 0) return {};
     return {
-      ...(this.loginPathUsed ? { loginPath: this.loginPathUsed } : {}),
-      loginAttempts: this.loginAttempts,
+      ...(path ? { loginPath: path } : {}),
+      loginAttempts: attempts,
     };
   }
 
@@ -252,6 +341,7 @@ export class ApiSession {
   ): Promise<{ response: Response; mode: AuthModeName }> {
     const token = mode === "login" ? await this.getToken(false) : undefined;
     let response = await this.fetchAuthed(mode, path, search, token);
+    // 429 is throttling. Retry-After is handled in fetchAuthed. Do not log in again.
     if (response.status !== 401) return { response, mode };
 
     if (mode === "login") {
@@ -280,17 +370,35 @@ export class ApiSession {
     }
     const headers = new Headers({ Accept: "application/json" });
     this.applyAuth(headers, mode, token);
-    try {
-      return await this.fetchImpl(url.toString(), {
-        headers,
-        cache: "no-store",
-        redirect: "manual",
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "SubcontractorHub request failed.";
-      throw new Error(redactSecrets(message, [this.config.apiKey, this.config.password, token]));
+    const secrets = [this.config.apiKey, this.config.password, token].filter((value): value is string => Boolean(value));
+    for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt += 1) {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(url.toString(), {
+          headers,
+          cache: "no-store",
+          redirect: "manual",
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "SubcontractorHub request failed.";
+        throw new Error(redactSecrets(message, secrets));
+      }
+      const observed = readRateLimitHeaders(response.headers, response.status, secrets);
+      if (observed) {
+        this.lastRateLimit = observed;
+        processMemory.rateLimit = observed;
+        if (response.status === 429) {
+          this.lastThrottle = observed;
+          processMemory.throttle = observed;
+        }
+      }
+      if (response.status !== 429 || attempt === MAX_RATE_LIMIT_RETRIES) return response;
+      const delay = retryDelayMs(response.headers, attempt + 1);
+      await discard(response);
+      await sleep(delay);
     }
+    throw new Error("SubcontractorHub request failed.");
   }
 
   private applyAuth(headers: Headers, mode: AuthModeName, token: string | undefined): void {
@@ -316,28 +424,65 @@ export class ApiSession {
     return this.tokenExpiresAt !== null && Date.now() >= this.tokenExpiresAt;
   }
 
+  private rememberToken(token: string, expiresAt: number): void {
+    this.token = token;
+    this.tokenExpiresAt = expiresAt;
+    processMemory.token = { key: sessionKey(this.config), value: token, expiresAt };
+  }
+
+  private adoptProcessToken(): void {
+    const saved = processMemory.token;
+    if (!saved || saved.key !== sessionKey(this.config)) return;
+    if (Date.now() >= saved.expiresAt) return;
+    this.token = saved.value;
+    this.tokenExpiresAt = saved.expiresAt;
+  }
+
   private async getToken(force: boolean): Promise<string> {
+    const key = sessionKey(this.config);
+    if (!force) this.adoptProcessToken();
     if (!force && this.token && !this.tokenExpired()) return this.token;
     const refresh = force || (this.token !== null && this.tokenExpired());
     if (refresh) {
       this.token = null;
       this.tokenExpiresAt = null;
+      if (processMemory.token?.key === key) processMemory.token = null;
+    }
+    const shared = !force ? processMemory.login : null;
+    if (shared?.key === key) {
+      const token = await shared.promise;
+      this.adoptProcessToken();
+      return this.token && !this.tokenExpired() ? this.token : token;
     }
     const generation = refresh ? ++this.generation : this.generation;
     if (this.inflight && this.inflightGeneration === generation) return this.inflight;
-    this.inflightGeneration = generation;
-    const pending = this.login().then((issued) => {
-      if (this.generation === generation) {
-        this.token = issued.token;
-        this.tokenExpiresAt = issued.expiresAt;
-      }
-      return issued.token;
+
+    // Publish the in-flight login before the first await. Otherwise a second
+    // session can start its own POST while this one is already inside fetch.
+    let resolveLogin: (token: string) => void = () => undefined;
+    let rejectLogin: (error: unknown) => void = () => undefined;
+    const gate = new Promise<string>((resolve, reject) => {
+      resolveLogin = resolve;
+      rejectLogin = reject;
     });
-    this.inflight = pending;
+    gate.catch(() => undefined);
+    this.inflightGeneration = generation;
+    this.inflight = gate;
+    processMemory.login = { key, promise: gate };
     try {
-      return await pending;
+      const issued = await this.login();
+      if (this.generation === generation) {
+        this.rememberToken(issued.token, issued.expiresAt);
+        processMemory.loginMeta = { key, path: this.loginPathUsed ?? "", attempts: this.loginAttempts };
+      }
+      resolveLogin(issued.token);
+      return issued.token;
+    } catch (error) {
+      rejectLogin(error);
+      throw error;
     } finally {
-      if (this.inflight === pending) this.inflight = null;
+      if (processMemory.login?.promise === gate) processMemory.login = null;
+      if (this.inflight === gate) this.inflight = null;
     }
   }
 
@@ -476,4 +621,9 @@ function tokenFromPayload(payload: unknown, depth = 0): string | null {
 
 async function discard(response: Response): Promise<void> {
   await response.arrayBuffer().catch(() => undefined);
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

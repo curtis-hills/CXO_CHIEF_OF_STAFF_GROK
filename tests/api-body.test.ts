@@ -7,8 +7,11 @@ import {
 } from "../lib/api/body";
 import { MAX_PAGES, PAGE_SIZE } from "../lib/api/limits";
 import { healthPayload } from "../lib/api/health-payload";
+import { MAX_RATE_LIMIT_RETRIES, retryDelayMs } from "../lib/api/rate-limit";
+import { PORTFOLIO_TTL_MS } from "../lib/api/limits";
 import { fetchOrgs, resetApiSession } from "../lib/api/client";
 import { ApiSession, type ApiAuthConfig } from "../lib/api/session";
+import { ageLiveInputsCache } from "../lib/data/live-cache";
 import { assemblePortfolio } from "../lib/data/assemble";
 import { readPortfolio } from "../lib/data/load";
 
@@ -32,6 +35,20 @@ function config(overrides: Partial<ApiAuthConfig> = {}): ApiAuthConfig {
     ...overrides,
   };
 }
+
+describe("rate limit wait", () => {
+  it("honors Retry-After and X-RateLimit-Reset, then backs off", () => {
+    const now = 1_700_000_000_000;
+    expect(retryDelayMs(headers({ "retry-after": "2" }), 1, now)).toBe(2_000);
+    expect(retryDelayMs(headers({ "retry-after": "0" }), 1, now)).toBe(0);
+    expect(retryDelayMs(headers({ "retry-after": new Date(now + 5_000).toUTCString() }), 1, now)).toBe(5_000);
+    expect(retryDelayMs(headers({ "x-ratelimit-reset": String(Math.floor(now / 1000) + 3) }), 1, now)).toBe(3_000);
+    expect(retryDelayMs(headers({ "retry-after": "999999" }), 1, now)).toBe(60_000);
+    expect(retryDelayMs(new Headers(), 1, now, () => 0)).toBe(500);
+    expect(retryDelayMs(new Headers(), 2, now, () => 0)).toBe(1_000);
+    expect(retryDelayMs(new Headers(), 3, now, () => 0)).toBe(2_000);
+  });
+});
 
 describe("API response shapes", () => {
   it("reads common list wrappers and Laravel pagination", async () => {
@@ -428,7 +445,195 @@ describe("page fallback", () => {
       globalThis.fetch = original;
     }
   });
+
+  it("loads per-org projects one at a time", async () => {
+    process.env.SUBHUB_API_USERNAME = "cxm-service";
+    process.env.SUBHUB_API_PASSWORD = PASSWORD;
+    process.env.SUBHUB_API_KEY = "";
+    process.env.SUBHUB_AUTH_MODE = "basic";
+    process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
+    resetApiSession();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/orgs")) {
+        return Response.json({
+          results: {
+            data: [
+              { id: "org_a", name: "Alpha Roofing" },
+              { id: "org_b", name: "Beta Roofing" },
+            ],
+          },
+        });
+      }
+      if (!url.includes("org_id=")) return Response.json({ results: { data: [] } });
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlight -= 1;
+      const orgId = new URL(url).searchParams.get("org_id");
+      return Response.json({ results: { data: [{ id: `p-${orgId}`, org_id: orgId }] } });
+    };
+    try {
+      const portfolio = await readPortfolio();
+      expect(maxInFlight).toBe(1);
+      expect(portfolio.mode).toBe("live");
+      expect(portfolio.accounts.map((account) => account.name).sort()).toEqual(["Alpha Roofing", "Beta Roofing"]);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("retries a 429 without logging in again, then keeps real orgs when projects stay limited", async () => {
+    process.env.SUBHUB_API_USERNAME = "cxm-service";
+    process.env.SUBHUB_API_PASSWORD = PASSWORD;
+    process.env.SUBHUB_API_KEY = "";
+    process.env.SUBHUB_AUTH_MODE = "login";
+    process.env.SUBHUB_LOGIN_PATH = "/api/auth/login";
+    process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
+    resetApiSession();
+    let logins = 0;
+    let projectAttempts = 0;
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if ((init?.method ?? "GET") === "POST") {
+        logins += 1;
+        return Response.json({ token: "cached-token-429", expiry: Math.floor(Date.now() / 1000) + 3600 });
+      }
+      if (url.includes("/orgs")) {
+        return Response.json({ results: { data: [{ id: "org_live", name: "Live Roofing", status: "launched" }] } });
+      }
+      projectAttempts += 1;
+      if (projectAttempts === 1) {
+        return new Response(JSON.stringify({ message: "Too Many Attempts" }), {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "0",
+            "x-ratelimit-limit": "60",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 30),
+          },
+        });
+      }
+      return Response.json({ results: { data: [{ id: "p1", org_id: "org_live" }] } });
+    };
+    try {
+      const recovered = await readPortfolio();
+      expect(logins).toBe(1);
+      expect(projectAttempts).toBe(2);
+      expect(recovered.mode).toBe("live");
+      expect(recovered.projectsAvailable).toBe(true);
+      expect(recovered.accounts.map((account) => account.name)).toEqual(["Live Roofing"]);
+      expect(recovered.notice).toBeNull();
+
+      resetApiSession();
+      logins = 0;
+      projectAttempts = 0;
+      globalThis.fetch = async (input, init) => {
+        const url = String(input);
+        if ((init?.method ?? "GET") === "POST") {
+          logins += 1;
+          return Response.json({ token: "cached-token-429", expiry: Math.floor(Date.now() / 1000) + 3600 });
+        }
+        if (url.includes("/orgs")) {
+          return Response.json({ results: { data: [{ id: "org_live", name: "Live Roofing", status: "Onboarding" }] } });
+        }
+        projectAttempts += 1;
+        return new Response(JSON.stringify({ message: "Too Many Attempts" }), {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "0",
+            "x-ratelimit-limit": "60",
+            "x-ratelimit-remaining": "0",
+          },
+        });
+      };
+      const partial = await readPortfolio();
+      expect(logins).toBe(1);
+      expect(projectAttempts).toBe(MAX_RATE_LIMIT_RETRIES + 1);
+      expect(partial.mode).toBe("live");
+      expect(partial.projectsAvailable).toBe(false);
+      expect(partial.accounts.map((account) => account.name)).toEqual(["Live Roofing"]);
+      expect(partial.accounts[0]?.projects).toEqual([]);
+      expect(partial.accounts[0]?.pace).toBeNull();
+      expect(partial.accounts[0]?.health.band).toBe("unscored");
+      expect(partial.notice).toContain("Projects could not be loaded");
+      expect(partial.notice).not.toContain("cached-token-429");
+      expect(partial.notice).not.toContain(PASSWORD);
+      expect(partial.accounts.some((account) => account.name === "Horizon Sales Partners")).toBe(false);
+      expect(partial.dataAsOf).toBeTruthy();
+    } finally {
+      globalThis.fetch = original;
+      delete process.env.SUBHUB_LOGIN_PATH;
+    }
+  });
+
+  it("shares one crawl and serves the last snapshot when a later refresh fails", async () => {
+    process.env.SUBHUB_API_USERNAME = "cxm-service";
+    process.env.SUBHUB_API_PASSWORD = PASSWORD;
+    process.env.SUBHUB_API_KEY = "";
+    process.env.SUBHUB_AUTH_MODE = "login";
+    process.env.SUBHUB_LOGIN_PATH = "/api/auth/login";
+    process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
+    resetApiSession();
+    let logins = 0;
+    let orgCalls = 0;
+    let refreshAttempts = 0;
+    let fail = false;
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      if ((init?.method ?? "GET") === "POST") {
+        logins += 1;
+        return Response.json({ token: "cached-token-snap", expiry: Math.floor(Date.now() / 1000) + 3600 });
+      }
+      if (fail) {
+        refreshAttempts += 1;
+        throw new Error("upstream down");
+      }
+      if (url.includes("/orgs")) {
+        orgCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return Response.json({ results: { data: [{ id: "org_live", name: "Live Roofing", status: "Onboarding" }] } });
+      }
+      return Response.json({ results: { data: [{ id: "p1", org_id: "org_live" }] } });
+    };
+    try {
+      const [first, second] = await Promise.all([readPortfolio(), readPortfolio()]);
+      expect(first.mode).toBe("live");
+      expect(second.accounts.map((account) => account.id)).toEqual(first.accounts.map((account) => account.id));
+      expect(orgCalls).toBe(1);
+      expect(logins).toBe(1);
+      const dataAsOf = first.dataAsOf;
+      ageLiveInputsCache(PORTFOLIO_TTL_MS + 1_000);
+      fail = true;
+      const stale = await readPortfolio();
+      expect(stale.mode).toBe("live");
+      expect(stale.accounts.map((account) => account.name)).toEqual(["Live Roofing"]);
+      expect(stale.dataAsOf).toBe(dataAsOf);
+      expect(stale.notice).toContain("last snapshot");
+      expect(stale.notice).not.toContain("cached-token-snap");
+      expect(stale.accounts.some((account) => account.name === "Horizon Sales Partners")).toBe(false);
+      const held = await readPortfolio();
+      expect(held.dataAsOf).toBe(dataAsOf);
+      expect(refreshAttempts).toBe(1);
+      expect(orgCalls).toBe(1);
+      expect(logins).toBe(1);
+    } finally {
+      globalThis.fetch = original;
+      delete process.env.SUBHUB_LOGIN_PATH;
+    }
+  });
 });
+
+function headers(init: Record<string, string>): Headers {
+  return new Headers(init);
+}
 
 function restore(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name];

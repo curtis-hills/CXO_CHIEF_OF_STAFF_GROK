@@ -70,15 +70,41 @@ export default async function AccountPage({
         />
         <Clock
           label="KPI clock"
-          value={account.pace ? `Day ${account.pace.day} of 60` : account.stage === "launched" ? "No day 0" : "Starts at Launched"}
-          hint={account.pace ? `${account.pace.actual} live · ${formatNumber(account.pace.expected, 1)} expected` : "Billing and live projects start here."}
+          value={
+            !account.projectsAvailable
+              ? "Projects unavailable"
+              : account.pace
+                ? `Day ${account.pace.day} of 60`
+                : account.stage === "launched"
+                  ? "No day 0"
+                  : "Starts at Launched"
+          }
+          hint={
+            !account.projectsAvailable
+              ? "Project counts are not loaded."
+              : account.pace
+                ? `${account.pace.actual} live · ${formatNumber(account.pace.expected, 1)} expected`
+                : "Billing and live projects start here."
+          }
           date={account.launchedAt}
         />
         <div className="rounded-lg border border-line bg-card px-4 py-3">
           <p className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted">Pace</p>
-          <div className="mt-2">{account.pace ? <PaceChip status={account.pace.status} /> : <span className="text-sm text-muted">Not started</span>}</div>
+          <div className="mt-2">
+            {!account.projectsAvailable ? (
+              <span className="text-sm text-muted">Projects unavailable</span>
+            ) : account.pace ? (
+              <PaceChip status={account.pace.status} />
+            ) : (
+              <span className="text-sm text-muted">Not started</span>
+            )}
+          </div>
           <p className="mt-2 text-xs text-muted">
-            {account.pace ? `Projected ${formatNumber(account.pace.projected, 1)} / ${account.pace.windowTarget}` : "Needs a Launched date"}
+            {!account.projectsAvailable
+              ? "Project counts are not loaded, so pace is not scored."
+              : account.pace
+                ? `Projected ${formatNumber(account.pace.projected, 1)} / ${account.pace.windowTarget}`
+                : "Needs a Launched date"}
           </p>
         </div>
         <div className="rounded-lg border border-line bg-card px-4 py-3">
@@ -178,7 +204,11 @@ export default async function AccountPage({
             </tr>
           </thead>
           <tbody>
-            {account.projects.length === 0 ? (
+            {!account.projectsAvailable ? (
+              <tr>
+                <td colSpan={5} className="text-sm text-muted">Projects are unavailable right now.</td>
+              </tr>
+            ) : account.projects.length === 0 ? (
               <tr>
                 <td colSpan={5} className="text-sm text-muted">No projects returned for this account.</td>
               </tr>
