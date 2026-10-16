@@ -46,7 +46,8 @@ export function pageOrder(rows: unknown[]): "newest-first" | "oldest-first" | "u
 }
 
 /**
- * On a newest-first page, rows after the high-water mark are already stored.
+ * On a newest-first page, rows older than the high-water mark are already stored.
+ * Rows that share the mark stay in the page: a tie is not the end of the list.
  * Oldest-first pages are not cut off here: stopping would drop newer rows that sit at the end.
  */
 export function splitAtHighWater(
@@ -64,10 +65,59 @@ export function splitAtHighWater(
       fresh.push(row);
       continue;
     }
-    if (Date.parse(iso) > mark) fresh.push(row);
-    else return { fresh, reached: true };
+    if (Date.parse(iso) < mark) return { fresh, reached: true };
+    fresh.push(row);
   }
   return { fresh, reached: false };
+}
+
+export type ResumeToken = {
+  cursor: string | null;
+  page: number | null;
+};
+
+/** A timestamp cursor is the same instant even when the string drops milliseconds. */
+export function canonicalCursor(cursor: string | null): string | null {
+  if (!cursor) return null;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(cursor) && cursor.length <= 40) {
+    const ms = Date.parse(cursor);
+    if (Number.isFinite(ms)) return new Date(ms).toISOString();
+  }
+  return cursor;
+}
+
+export function resumeAdvanced(before: ResumeToken, after: ResumeToken): boolean {
+  if (canonicalCursor(before.cursor) !== canonicalCursor(after.cursor)) return true;
+  return (before.page ?? null) !== (after.page ?? null);
+}
+
+export function rowIds(rows: unknown[]): string[] {
+  const ids: string[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const id = (row as { id?: unknown }).id;
+    if (typeof id === "string" && id.trim()) ids.push(id.trim());
+    else if (typeof id === "number" && Number.isFinite(id)) ids.push(String(id));
+  }
+  return ids;
+}
+
+/** True when this page is entirely rows we already saw on the previous page. */
+export function pageRepeated(previousIds: readonly string[], nextIds: readonly string[]): boolean {
+  if (previousIds.length === 0 || nextIds.length === 0) return false;
+  const seen = new Set(previousIds);
+  return nextIds.every((id) => seen.has(id));
+}
+
+/** Next 1-based offset page after `storedRows` rows of `pageSize`. */
+export function nextOffsetPage(storedRows: number, pageSize: number): number {
+  if (!Number.isFinite(storedRows) || storedRows <= 0) return 1;
+  if (!Number.isFinite(pageSize) || pageSize <= 0) return 1;
+  return Math.floor(storedRows / pageSize) + 1;
+}
+
+export function cursorStallMessage(endpoint: string): string {
+  return `${endpoint} cursor did not advance. The same page came back, so this run stopped instead of repeating it.`;
 }
 
 export function nextFilter(unsupported: readonly string[]): FilterParam | null {

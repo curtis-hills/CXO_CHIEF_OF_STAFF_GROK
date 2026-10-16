@@ -5,14 +5,21 @@ import { fetchCollectionPage } from "../api/client";
 import { assemblePortfolio } from "../data/assemble";
 import { readOverrides } from "../data/overrides";
 import { ENDPOINTS, endpointById, type EndpointId } from "./catalog";
+import { PAGE_SIZE } from "../api/limits";
 import {
   advanceHighWater,
+  cursorStallMessage,
+  nextOffsetPage,
   paceDelayMs,
   pacificDay,
   pageOrder,
+  pageRepeated,
+  resumeAdvanced,
+  rowIds,
   selectSyncQuery,
   shouldFullReconcile,
   splitAtHighWater,
+  type ResumeToken,
 } from "./high-water";
 import { ensureMigrations } from "../db/migrate";
 import { databaseUrl } from "../db/sql";
@@ -136,6 +143,9 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
   let runEndpoint: EndpointId | null = null;
   let runRows = 0;
   let runPages = 0;
+  let runToken: ResumeToken | null = null;
+  let runCount = 0;
+  const trail = { ids: [] as string[] };
 
   const closeRun = async (nextStatus: "ok" | "error" | "unsupported", nextError: string | null) => {
     if (!runId) return;
@@ -151,6 +161,10 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
       runEndpoint = next;
       runRows = 0;
       runPages = 0;
+      trail.ids = [];
+      const starting = states.get(next)!;
+      runToken = { cursor: starting.cursor, page: starting.page };
+      runCount = await store.rowCount(next);
       runId = crypto.randomUUID();
       await store.insertRun({
         id: runId,
@@ -163,7 +177,7 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
       error = null;
     }
     endpoint = next;
-    const outcome = await pullPage(store, next, states.get(next)!, kind, now);
+    const outcome = await pullPage(store, next, states.get(next)!, kind, now, trail);
     rows += outcome.rows;
     runRows += outcome.rows;
     if (outcome.countedPage) {
@@ -180,6 +194,20 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
       const wait = Math.max(gapMs, outcome.delayMs);
       if (Date.now() + wait - started > budgetMs) break;
       await sleep(wait);
+    }
+  }
+
+  if (runEndpoint && runToken && !hardError && status === "ok") {
+    const endState = states.get(runEndpoint)!;
+    const endToken = { cursor: endState.cursor, page: endState.page };
+    const grew = (await store.rowCount(runEndpoint)) > runCount;
+    if (!endState.backfillComplete && !endState.disabled && runPages > 0 && !resumeAdvanced(runToken, endToken) && !grew) {
+      endState.lastError = cursorStallMessage(runEndpoint);
+      await store.saveCursor(runEndpoint, endState);
+      hardError = true;
+      status = "error";
+      error = endState.lastError;
+      console.error(`CXM sync failed: ${error}`);
     }
   }
 
@@ -209,7 +237,14 @@ type PageOutcome = {
   delayMs: number;
 };
 
-async function pullPage(store: SyncStore, id: EndpointId, state: CursorState, kind: SyncKind, now: Date): Promise<PageOutcome> {
+async function pullPage(
+  store: SyncStore,
+  id: EndpointId,
+  state: CursorState,
+  kind: SyncKind,
+  now: Date,
+  trail: { ids: string[] },
+): Promise<PageOutcome> {
   const endpoint = endpointById(id);
   const mode = kind === "backfill" || !state.backfillComplete ? "backfill" : "incremental";
   if (
@@ -327,31 +362,97 @@ async function pullPage(store: SyncStore, id: EndpointId, state: CursorState, ki
     mode === "incremental" && !state.fullPass && !query.filter
       ? splitAtHighWater(items, state.highWater, order)
       : { fresh: items, reached: false };
+  const ids = rowIds(items);
+  const requested: ResumeToken = { cursor: state.cursor, page: state.page };
+  const offsetMode = state.page != null && state.cursor == null;
+  const returned: ResumeToken | null = page.next
+    ? { cursor: page.next.cursor ?? null, page: page.next.page ?? null }
+    : null;
+  const before = offsetMode ? await store.rowCount(id) : 0;
   const stored = await storeRows(store, id, split.fresh);
+  const inserted = offsetMode ? (await store.rowCount(id)) - before : null;
   state.highWater = advanceHighWater(state.highWater, split.fresh);
-  const done = split.reached || !page.next;
-  if (done && state.strategy === "per-org") {
-    state.orgIndex += 1;
-    state.cursor = null;
-    state.page = null;
-    const ids = await store.listOrgIds();
-    if (state.orgIndex >= ids.length) finishPass(state, now);
-  } else if (done) {
-    finishPass(state, now);
-  } else {
-    state.cursor = page.next?.cursor ?? null;
-    state.page = page.next?.page ?? null;
-  }
-  await store.saveCursor(id, state);
-  return {
+  const delayMs = paceDelayMs(page.rateLimit?.remaining ?? null, page.rateLimit?.reset ?? null);
+  const tokenStuck =
+    returned != null &&
+    (requested.cursor != null || requested.page != null) &&
+    !resumeAdvanced(requested, returned);
+  const rowsStuck = pageRepeated(trail.ids, ids);
+
+  const ok = (sleep: boolean): PageOutcome => ({
     rows: stored,
     countedPage: true,
     status: "ok",
     error: null,
     hardError: false,
-    sleep: !state.passComplete,
-    delayMs: paceDelayMs(page.rateLimit?.remaining ?? null, page.rateLimit?.reset ?? null),
-  };
+    sleep,
+    delayMs,
+  });
+
+  if (offsetMode && items.length < PAGE_SIZE) {
+    await finishList(store, state, now);
+    trail.ids = ids;
+    await store.saveCursor(id, state);
+    return ok(false);
+  }
+  if (offsetMode && inserted === 0 && items.length > 0) {
+    return stall(store, id, state, stored);
+  }
+
+  const done = split.reached || !page.next;
+  if (done && state.strategy === "per-org") {
+    state.orgIndex += 1;
+    state.cursor = null;
+    state.page = null;
+    const orgIds = await store.listOrgIds();
+    if (state.orgIndex >= orgIds.length) finishPass(state, now);
+  } else if (done) {
+    finishPass(state, now);
+  } else if (!offsetMode && (tokenStuck || rowsStuck)) {
+    // The API handed back the same cursor, usually a shared updated_at used as
+    // a >= watermark. Keep the rows already stored and walk the list by page.
+    const storedRows = await store.rowCount(id);
+    state.cursor = null;
+    state.page = nextOffsetPage(storedRows, PAGE_SIZE);
+    state.lastError = null;
+  } else if (offsetMode) {
+    state.page = (state.page ?? 1) + 1;
+    state.cursor = null;
+    state.lastError = null;
+  } else {
+    state.cursor = returned?.cursor ?? null;
+    state.page = returned?.page ?? null;
+    state.lastError = null;
+  }
+  trail.ids = ids;
+  await store.saveCursor(id, state);
+  return ok(!state.passComplete);
+}
+
+async function finishList(store: SyncStore, state: CursorState, now: Date): Promise<void> {
+  if (state.strategy === "per-org") {
+    state.orgIndex += 1;
+    state.cursor = null;
+    state.page = null;
+    const orgIds = await store.listOrgIds();
+    if (state.orgIndex >= orgIds.length) finishPass(state, now);
+    return;
+  }
+  finishPass(state, now);
+}
+
+function stall(store: SyncStore, id: EndpointId, state: CursorState, stored: number): Promise<PageOutcome> {
+  state.lastError = cursorStallMessage(id);
+  console.error(`CXM sync failed: ${state.lastError}`);
+  return store.saveCursor(id, state).then(() => ({
+    rows: stored,
+    countedPage: true,
+    status: "error" as const,
+    error: state.lastError,
+    hardError: true,
+    sleep: false,
+    delayMs: 0,
+  }));
 }
 
 function finishPass(state: CursorState, now: Date): void {
@@ -359,6 +460,7 @@ function finishPass(state: CursorState, now: Date): void {
   state.backfillComplete = true;
   state.cursor = null;
   state.page = null;
+  state.lastError = null;
   if (state.fullPass) {
     state.lastReconcileDay = pacificDay(now);
     state.fullPass = false;

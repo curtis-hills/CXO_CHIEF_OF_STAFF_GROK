@@ -62,6 +62,7 @@ export interface SyncStore {
   finishRun(id: string, patch: Pick<SyncRunRow, "rows" | "pages" | "status" | "error">): Promise<void>;
   listRuns(limit: number): Promise<SyncRunRow[]>;
   orgCount(): Promise<number>;
+  rowCount(endpoint: EndpointId): Promise<number>;
   listOrgIds(): Promise<string[]>;
   loadOrgPayloads(): Promise<ApiOrg[]>;
   loadProjectsByOrg(): Promise<Record<string, ApiProject[]>>;

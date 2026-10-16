@@ -7,6 +7,7 @@ export type EndpointProgress = {
   state: EndpointPhase;
   highWater: string | null;
   resume: boolean;
+  lastError: string | null;
 };
 
 export function endpointPhase(cursor: CursorState | null | undefined): EndpointPhase {
@@ -20,7 +21,16 @@ export function endpointProgress(cursor: CursorState | null | undefined): Endpoi
     state: endpointPhase(cursor),
     highWater: cursor?.highWater ?? null,
     resume: Boolean(cursor?.cursor || cursor?.page),
+    lastError: cursor?.lastError ?? null,
   };
+}
+
+/** Page label. A repeated cursor stays in progress for /api/health and reads as Stalled here. */
+export function backfillLabel(cursor: CursorState | null | undefined): string {
+  if (cursor?.disabled) return "Unsupported";
+  if (cursor?.backfillComplete) return "Complete";
+  if (cursor?.lastError?.includes("did not advance")) return "Stalled";
+  return "In progress";
 }
 
 /** A missing cursor is still in progress. Unsupported endpoints are finished. */
