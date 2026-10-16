@@ -47,7 +47,7 @@ describe("API auth", () => {
       },
     );
     const report = await session.probe();
-    expect(report).toEqual({ status: "connected", mode: "bearer", httpStatus: 200 });
+    expect(report).toMatchObject({ status: "connected", mode: "bearer", httpStatus: 200, bodyKind: "json", recordCount: 0 });
     expect(headersOf(calls[0]?.init).get("authorization")).toBe(`Bearer ${API_KEY}`);
     expect(calls[0]?.url).toContain("https://app.subcontractorhub.com/api/v1/superadmin/orgs");
   });
@@ -79,7 +79,7 @@ describe("API auth", () => {
       },
     );
     const report = await session.probe();
-    expect(report).toEqual({ status: "connected", mode: "basic+key", httpStatus: 200 });
+    expect(report).toMatchObject({ status: "connected", mode: "basic+key", httpStatus: 200, bodyKind: "json" });
     const headers = headersOf(calls[0]?.init);
     expect(headers.get("authorization")).toBe(basicAuthorization("cxm-service", PASSWORD));
     expect(headers.get("authorization")).not.toMatch(/^Bearer /);
@@ -114,7 +114,7 @@ describe("API auth", () => {
       return new Response("no", { status: 401 });
     });
     const report = await session.probe();
-    expect(report).toEqual({ status: "auth failed", httpStatus: 401 });
+    expect(report).toMatchObject({ status: "auth failed", httpStatus: 401, mode: "basic+key" });
     expect(posts).toBe(0);
   });
 
@@ -136,7 +136,7 @@ describe("API auth", () => {
       return json({ results: { data: [] } });
     });
     const report = await session.probe();
-    expect(report).toEqual({ status: "connected", mode: "login", httpStatus: 200 });
+    expect(report).toMatchObject({ status: "connected", mode: "login", httpStatus: 200 });
     expect(calls.filter((call) => call.startsWith("POST"))).toHaveLength(1);
   });
 
@@ -172,7 +172,7 @@ describe("API auth", () => {
       return new Response("no", { status: 401 });
     });
     const report = await session.probe();
-    expect(report).toEqual({ status: "auth failed", httpStatus: 401 });
+    expect(report).toMatchObject({ status: "auth failed", httpStatus: 401, mode: "login" });
     expect(logins).toBe(2);
   });
 

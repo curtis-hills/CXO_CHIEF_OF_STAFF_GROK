@@ -1,6 +1,15 @@
 import "server-only";
 
 import {
+  collectAll,
+  emptySummary,
+  inspectResponse,
+  SubhubApiError,
+  UnrecognizedCollectionError,
+  type PageQuery,
+  type ResponseSummary,
+} from "./body";
+import {
   ApiSession,
   AuthRejectedError,
   connectionIntent,
@@ -8,19 +17,9 @@ import {
   type AuthModeName,
   type ConnectionReport,
 } from "./session";
-import type { ApiOrg, ApiProject, CursorPage } from "./types";
+import type { ApiOrg, ApiProject } from "./types";
 
-export class SubhubApiError extends Error {
-  readonly status: number;
-  readonly path: string;
-
-  constructor(status: number, path: string) {
-    super(`SubcontractorHub API ${path} returned ${status}`);
-    this.name = "SubhubApiError";
-    this.status = status;
-    this.path = path;
-  }
-}
+export { SubhubApiError };
 
 let session: ApiSession | null = null;
 let sessionFingerprint = "";
@@ -61,39 +60,53 @@ export async function checkApiConnection(): Promise<ConnectionReport> {
   return currentSession().probe();
 }
 
-async function shGet<T>(path: string, search?: Record<string, string | number | undefined>): Promise<T> {
+export function resetApiSession(): void {
+  session = null;
+  sessionFingerprint = "";
+}
+
+function configuredSecrets(): string[] {
+  const config = readApiAuthConfig(process.env);
+  return [config.apiKey, config.password].filter((value) => value.length >= 3);
+}
+
+async function readPayload(
+  path: string,
+  search?: Record<string, string | number | undefined>,
+): Promise<{ payload: unknown; summary: ResponseSummary; status: number }> {
   let response: Response;
   try {
     ({ response } = await currentSession().request(path, search));
   } catch (error) {
-    if (error instanceof AuthRejectedError) throw new SubhubApiError(401, path);
+    if (error instanceof AuthRejectedError) throw new SubhubApiError(401, path, emptySummary("credentials rejected"));
     throw error;
   }
-  if (!response.ok || (response.status >= 300 && response.status < 400)) {
-    await response.arrayBuffer().catch(() => undefined);
-    throw new SubhubApiError(response.status, path);
+  const text = await response.text();
+  const { summary, payload } = inspectResponse(response.headers.get("content-type"), text, configuredSecrets());
+  if (!response.ok || (response.status >= 300 && response.status < 400) || summary.bodyKind !== "json" || payload === null) {
+    throw new SubhubApiError(response.status, path, summary);
   }
-  try {
-    return (await response.json()) as T;
-  } catch {
-    throw new SubhubApiError(response.status, path);
-  }
+  return { payload, summary, status: response.status };
 }
 
 export async function fetchAllPages<T>(
   path: string,
   params: Record<string, string | number | undefined> = {},
 ): Promise<T[]> {
-  const items: T[] = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < 40; page += 1) {
-    const body = await shGet<CursorPage<T>>(path, { ...params, limit: 50, cursor });
-    items.push(...(body.results?.data ?? []));
-    const next = body.results?.next_cursor ?? undefined;
-    if (!next || next === cursor) break;
-    cursor = next;
+  const last: { summary?: ResponseSummary; status?: number } = {};
+  try {
+    return await collectAll<T>(async (query: PageQuery) => {
+      const read = await readPayload(path, { ...params, limit: 50, cursor: query.cursor, page: query.page });
+      last.summary = read.summary;
+      last.status = read.status;
+      return read.payload;
+    });
+  } catch (error) {
+    if (error instanceof UnrecognizedCollectionError && last.summary && last.status) {
+      throw new SubhubApiError(last.status, path, last.summary);
+    }
+    throw error;
   }
-  return items;
 }
 
 async function mapPool<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {

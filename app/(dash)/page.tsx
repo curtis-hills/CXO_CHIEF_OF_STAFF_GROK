@@ -137,7 +137,13 @@ export default async function OverviewPage() {
           </Panel>
           <Panel title="Data">
             <ul className="space-y-2 text-sm leading-5">
-              <li>{portfolio.mode === "mock" ? "Reading demo data." : "Reading the Executive API."}</li>
+              <li>
+                {portfolio.notice
+                  ? "Showing demo data because the live API could not be read."
+                  : portfolio.mode === "mock"
+                    ? "Reading demo data."
+                    : "Reading the Executive API."}
+              </li>
               <li>{proxyDates} lifecycle dates are proxies. {missingLaunch.length} launched {missingLaunch.length === 1 ? "account has" : "accounts have"} no day 0.</li>
               <li>{handoffs.length} new handoffs in the last 7 days. {red.length} accounts are red on v1 health.</li>
               <li>No snapshot database yet. The later Postgres shapes live in the data schema file.</li>
