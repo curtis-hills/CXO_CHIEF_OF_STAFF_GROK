@@ -1,7 +1,9 @@
 import Link from "next/link";
-import { PaceChip, PageHeader, SourceBadge } from "@/components/ui";
+import { LaunchDateLabel, PaceChip, PageHeader, PaymentChip } from "@/components/ui";
 import { Sparkline } from "@/components/charts";
+import { OrgBreakdown, OrgFilterFields, filterNote } from "@/components/org-filter";
 import { accountTypeLabel, type Account } from "@/lib/domain";
+import { visibleBook } from "@/lib/data/filters";
 import { loadPortfolio } from "@/lib/data/load";
 import { cohortAccounts } from "@/lib/data/views";
 import { formatNumber, one } from "@/lib/format";
@@ -16,19 +18,17 @@ export default async function CohortPage({
 }) {
   const query = await searchParams;
   const portfolio = await loadPortfolio();
+  const { filter, accounts } = visibleBook(portfolio, query);
   const status = one(query.status);
-  const cxm = one(query.cxm);
   const type = one(query.type);
   const stage = one(query.stage);
   const health = one(query.health);
   const from = one(query.from);
   const to = one(query.to);
-  const cxms = [...new Set(portfolio.accounts.map((account) => account.cxm?.name).filter((name): name is string => Boolean(name)))].sort();
 
-  const pool = stage ? portfolio.accounts.filter((account) => account.stage === stage) : cohortAccounts(portfolio.accounts);
+  const pool = stage ? accounts.filter((account) => account.stage === stage) : cohortAccounts(accounts);
   const rows = pool
     .filter((account) => !status || account.pace?.status === status || (status === "missing" && !account.pace))
-    .filter((account) => !cxm || account.cxm?.name === cxm)
     .filter((account) => !health || account.health.band === health)
     .filter((account) => inRange(account.launchedAt.iso, from, to))
     .filter((account) => {
@@ -44,9 +44,10 @@ export default async function CohortPage({
       <PageHeader
         eyebrow="Launched cohort"
         title="Pace against 10 in 30 and 25 in 60"
-        lede="A transaction is a new project created on or after Launched, which is also the signed customer billed at $35. The KPI clock starts at Launched. Expected pace is 10×day/30 through day 30, then 10+15×(day−30)/30 through day 60. On pace is a ratio of at least 1.0. Watch is at least 0.7. At risk is under 0.7, or no project in 7 days. Accounts past day 90 move to post-launch health."
+        lede="A transaction is a new project created on or after Launched, which is also the signed customer billed at $35. The KPI clock starts at Launched. Expected pace is 10×day/30 through day 30, then 10+15×(day−30)/30 through day 60. On pace is a ratio of at least 1.0. Watch is at least 0.7. At risk is under 0.7, or no project in 7 days. Accounts past day 90 move to post-launch health. Until launched_at exists (P0-1), a launched account is labeled Launch date unknown and the earliest project date is the proxy."
       />
-      <form className="mb-4 flex flex-wrap items-end gap-3" method="get">
+      <form key={JSON.stringify(query)} className="mb-3 flex flex-wrap items-end gap-3" method="get">
+        <OrgFilterFields filter={filter} accounts={portfolio.accounts} />
         <label className="text-xs text-muted">
           Pace
           <select name="status" defaultValue={status} className="field mt-1 block">
@@ -100,19 +101,17 @@ export default async function CohortPage({
           Launched to
           <input name="to" type="date" defaultValue={to} className="field mt-1 block" />
         </label>
-        <label className="text-xs text-muted">
-          CXM
-          <select name="cxm" defaultValue={cxm} className="field mt-1 block">
-            <option value="">All</option>
-            {cxms.map((name) => (
-              <option key={name}>{name}</option>
-            ))}
-          </select>
-        </label>
         <button type="submit" className="rounded-md bg-navy px-3 py-2 text-sm text-white">
-          Filter
+          Apply
         </button>
       </form>
+      <p className="mb-4 max-w-3xl text-xs leading-5 text-muted">{filterNote(portfolio.mode)}</p>
+      <OrgBreakdown
+        accounts={accounts}
+        highlightStatuses={filter.statuses}
+        sliceLabel="in this pace table"
+        sliceCount={rows.length}
+      />
       <div className="overflow-x-auto rounded-lg border border-line bg-card">
         <table className="data">
           <thead>
@@ -167,13 +166,12 @@ function CohortRow({ account }: { account: Account }) {
         <p className="mt-0.5 text-xs text-muted">
           {accountTypeLabel(account.accountType, account.legacySeamlessDealer)} · {account.cxm?.name ?? "Unassigned"}
         </p>
+        <p className="mt-1 flex flex-wrap items-center gap-2">
+          <LaunchDateLabel unknown={account.launchDateUnknown} source={account.launchedAt.source} />
+          <PaymentChip status={account.paymentStatus} />
+        </p>
       </td>
-      <td className="num">
-        {pace ? pace.day : "—"}
-        <span className="ml-2 inline-block align-middle">
-          <SourceBadge source={account.launchedAt.source} />
-        </span>
-      </td>
+      <td className="num">{pace ? pace.day : "—"}</td>
       <td className="num">{pace ? pace.actual : "—"}</td>
       <td className="num">{pace ? formatNumber(pace.expected, 1) : "—"}</td>
       <td className="num">{gap === null ? "—" : formatNumber(gap, 1)}</td>

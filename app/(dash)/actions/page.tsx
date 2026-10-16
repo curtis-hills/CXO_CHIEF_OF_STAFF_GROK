@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Chip, PageHeader } from "@/components/ui";
+import { visibleBook } from "@/lib/data/filters";
 import { loadPortfolio } from "@/lib/data/load";
 import { one } from "@/lib/format";
 import type { AlertSeverity } from "@/lib/domain";
@@ -21,8 +22,9 @@ export default async function ActionsPage({
   const severity = one(query.severity);
   const type = one(query.type);
   const portfolio = await loadPortfolio();
-  const types = [...new Set(portfolio.alerts.map((alert) => alert.type))].sort();
-  const rows = portfolio.alerts
+  const { alerts } = visibleBook(portfolio, query);
+  const types = [...new Set(alerts.map((alert) => alert.type))].sort();
+  const rows = alerts
     .filter((alert) => !severity || alert.severity === severity)
     .filter((alert) => !type || alert.type === type);
 

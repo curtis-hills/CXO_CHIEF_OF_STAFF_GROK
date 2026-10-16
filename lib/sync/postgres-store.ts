@@ -1,6 +1,7 @@
 import "server-only";
 
 import type { ApiOrg, ApiProject } from "../api/types";
+import { projectsByOrg, type StoredChildLinkRow, type StoredProjectLinkRow } from "../data/project-orgs";
 import { getSql } from "../db/sql";
 import type { EndpointId } from "./catalog";
 import type { GenericRow, OrgRow, ProjectRow, SubscriptionRow } from "./rows";
@@ -284,15 +285,39 @@ export class PostgresStore implements SyncStore {
   }
 
   async loadProjectsByOrg(): Promise<Record<string, ApiProject[]>> {
-    const rows = await getSql().query(`SELECT org_id, raw FROM projects`);
-    const grouped: Record<string, ApiProject[]> = {};
-    for (const row of rows) {
-      const record = row as { org_id: string | null; raw: ApiProject };
-      if (!record.org_id) continue;
-      grouped[record.org_id] ??= [];
-      grouped[record.org_id].push(record.raw);
-    }
-    return grouped;
+    const sql = getSql();
+    const [orgRows, projectRows, commissionRows, esignRows, financialRows] = await Promise.all([
+      sql.query(`SELECT id FROM orgs`),
+      sql.query(`SELECT id, org_id, job_type, system_size, is_test, deleted_at, created_at, raw FROM projects`),
+      sql.query(`SELECT org_id, project_id, raw FROM commissions`),
+      sql.query(`SELECT org_id, project_id, raw FROM esign_status`),
+      sql.query(`SELECT org_id, project_id, raw FROM financials`),
+    ]);
+    const child = (row: Record<string, unknown>): StoredChildLinkRow => ({
+      orgId: typeof row.org_id === "string" ? row.org_id : null,
+      projectId: typeof row.project_id === "string" ? row.project_id : null,
+      raw: row.raw,
+    });
+    const projects: StoredProjectLinkRow[] = projectRows.map((row) => {
+      const record = row as Record<string, unknown>;
+      return {
+        id: String(record.id),
+        orgId: typeof record.org_id === "string" ? record.org_id : null,
+        raw: record.raw,
+        createdAt: iso(record.created_at),
+        deletedAt: iso(record.deleted_at),
+        isTest: typeof record.is_test === "boolean" ? record.is_test : null,
+        jobType: typeof record.job_type === "string" ? record.job_type : null,
+        systemSize: typeof record.system_size === "string" ? record.system_size : null,
+      };
+    });
+    return projectsByOrg({
+      orgIds: orgRows.map((row) => String((row as { id: string }).id)),
+      projects,
+      commissions: commissionRows.map((row) => child(row as Record<string, unknown>)),
+      esign: esignRows.map((row) => child(row as Record<string, unknown>)),
+      financials: financialRows.map((row) => child(row as Record<string, unknown>)),
+    }).projectsByOrg;
   }
 
   async projectRowCount(): Promise<number> {

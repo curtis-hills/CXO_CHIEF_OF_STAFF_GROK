@@ -1,10 +1,11 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { PaceChart } from "@/components/charts";
-import { Chip, HealthChip, PaceChip, SlaChip, SourceBadge } from "@/components/ui";
+import { Chip, HealthChip, LaunchDateLabel, PaceChip, PaymentChip, SlaChip, SourceBadge } from "@/components/ui";
 import { saveLifecycleOverride } from "./actions";
 import { TRANSACTION_FEE_USD, accountTypeLabel, requiredCompletion, type Account, type ChecklistItem, type ResolvedDate } from "@/lib/domain";
 import { loadPortfolio } from "@/lib/data/load";
+import { isPaymentFlagged } from "@/lib/data/filters";
 import { dayInputValue, formatDate, formatNumber, formatUsd, one } from "@/lib/format";
 import type { StageSpan } from "@/lib/metrics/stage";
 
@@ -39,7 +40,10 @@ export default async function AccountPage({
         <div className="flex flex-wrap items-center gap-2">
           <Chip tone="neutral">{accountTypeLabel(account.accountType, account.legacySeamlessDealer)}</Chip>
           <Chip tone="neutral">{account.status}{account.subStatus ? ` / ${account.subStatus}` : ""}</Chip>
-          <Chip tone={account.paymentStatus === "paid" ? "good" : "bad"}>{account.paymentStatus}</Chip>
+          <Chip tone={isPaymentFlagged(account.paymentStatus) ? "bad" : account.paymentStatus === "paid" || account.paymentStatus === "active" ? "good" : "neutral"}>
+            {account.paymentStatus}
+          </Chip>
+          <PaymentChip status={account.paymentStatus} />
           <SourceBadge source={account.accountTypeSource} />
         </div>
         <h1 className="mt-3 font-serif text-[2rem] leading-tight">{account.name}</h1>
@@ -75,18 +79,25 @@ export default async function AccountPage({
               ? "Projects unavailable"
               : account.pace
                 ? `Day ${account.pace.day} of 60`
-                : account.stage === "launched"
-                  ? "No day 0"
-                  : "Starts at Launched"
+                : account.launchDateUnknown
+                  ? "Launch date unknown"
+                  : account.stage === "launched"
+                    ? "No day 0"
+                    : "Starts at Launched"
           }
           hint={
             !account.projectsAvailable
               ? "Project counts are not loaded."
-              : account.pace
-                ? `${account.pace.actual} live · ${formatNumber(account.pace.expected, 1)} expected`
-                : "Billing and live projects start here."
+              : account.launchDateUnknown
+                ? account.launchedAt.source === "proxy"
+                  ? `${account.pace ? `${account.pace.actual} live · ${formatNumber(account.pace.expected, 1)} expected. ` : ""}Earliest project date is a proxy (P0-1).`
+                  : "No project date is stored yet to use as a proxy (P0-1)."
+                : account.pace
+                  ? `${account.pace.actual} live · ${formatNumber(account.pace.expected, 1)} expected`
+                  : "Billing and live projects start here."
           }
           date={account.launchedAt}
+          unknown={account.launchDateUnknown}
         />
         <div className="rounded-lg border border-line bg-card px-4 py-3">
           <p className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted">Pace</p>
@@ -234,15 +245,27 @@ export default async function AccountPage({
   );
 }
 
-function Clock({ label, value, hint, date }: { label: string; value: string; hint: string; date: ResolvedDate }) {
+function Clock({
+  label,
+  value,
+  hint,
+  date,
+  unknown = false,
+}: {
+  label: string;
+  value: string;
+  hint: string;
+  date: ResolvedDate;
+  unknown?: boolean;
+}) {
   return (
     <div className="rounded-lg border border-line bg-card px-4 py-3">
       <p className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted">{label}</p>
       <p className="num mt-1 text-2xl">{value}</p>
       <p className="mt-1 text-xs text-muted">{hint}</p>
-      <p className="mt-2 flex items-center gap-2 text-xs">
+      <p className="mt-2 flex flex-wrap items-center gap-2 text-xs">
         <span>{formatDate(date.iso)}</span>
-        <SourceBadge source={date.source} />
+        <LaunchDateLabel unknown={unknown} source={date.source} />
       </p>
     </div>
   );
