@@ -69,6 +69,9 @@ export type Account = {
   cancellationRequested: boolean;
   city: string;
   state: string;
+  postalCode: string;
+  street: string;
+  country: string;
   products: string[];
   customerTypes: string[];
   activeUserCount: number;

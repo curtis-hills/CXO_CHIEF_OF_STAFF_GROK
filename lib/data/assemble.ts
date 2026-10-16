@@ -63,11 +63,27 @@ function accountTypeFromApi(value: string | null | undefined, legacyFlag: boolea
 }
 
 function inferAccountType(org: ApiOrg): { type: AccountType; legacy: boolean } {
-  const blob = [...(org.customer_types ?? []), ...(org.products ?? []), org.name ?? ""].join(" ").toLowerCase();
+  const planNames = (org.subscriptions ?? []).map((subscription) => subscription.plan?.name ?? "");
+  const blob = [...(org.customer_types ?? []), ...(org.products ?? []), ...planNames, org.name ?? ""].join(" ").toLowerCase();
   if (blob.includes("installing")) return { type: "seamless_installing_dealer", legacy: false };
   if (blob.includes("seamless dealer")) return { type: "sales_org", legacy: true };
-  if (blob.includes("sales")) return { type: "sales_org", legacy: false };
+  if (blob.includes("sales and referrals") || blob.includes("sales")) return { type: "sales_org", legacy: false };
   return { type: "epc", legacy: false };
+}
+
+function planInterval(name: string, interval: string | null | undefined): string {
+  if (typeof interval === "string" && interval.trim()) return interval.trim();
+  if (/per contract|per sign/i.test(name)) return "contract";
+  if (/year/i.test(name)) return "year";
+  if (/month/i.test(name)) return "month";
+  return "month";
+}
+
+function textField(...values: Array<string | null | undefined>): string {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
 }
 
 function money(value: number | string | null | undefined): number {
@@ -133,7 +149,7 @@ function toAccount(
     accountType = inferred.type;
     legacySeamlessDealer = inferred.legacy;
     accountTypeSource = "proxy";
-    accountTypeNote = `Inferred from customer type until account_type ships. ${P0_NOTE}`;
+    accountTypeNote = `Inferred from customer type or plan name until account_type ships. ${P0_NOTE}`;
   }
 
   const subStatus = org.sub_status ?? null;
@@ -257,19 +273,25 @@ function toAccount(
     failedPaymentDays,
     paymentAgeSource,
     cancellationRequested: false,
-    city: org.address?.city ?? "",
-    state: org.address?.state ?? "",
+    city: textField(org.city, org.address?.city),
+    state: textField(org.state, org.address?.state),
+    postalCode: textField(org.postal_code, org.address?.postal_code),
+    street: textField(org.street, org.address?.street),
+    country: textField(org.country, org.address?.country),
     products: org.products ?? [],
     customerTypes: org.customer_types ?? [],
     activeUserCount: org.active_user_count ?? 0,
     cxm: person(org.customer_experience_manager),
     ae: person(org.account_executive),
-    subscriptions: (org.subscriptions ?? []).map((subscription) => ({
-      status: subscription.status ?? "unknown",
-      planName: subscription.plan?.name ?? "Plan",
-      unitPrice: money(subscription.plan?.unit_price),
-      interval: subscription.plan?.interval ?? "month",
-    })),
+    subscriptions: (org.subscriptions ?? []).map((subscription) => {
+      const planName = subscription.plan?.name?.trim() || "Plan";
+      return {
+        status: subscription.status ?? "unknown",
+        planName,
+        unitPrice: money(subscription.plan?.unit_price),
+        interval: planInterval(planName, subscription.plan?.interval),
+      };
+    }),
     onboardingAt,
     readyToLaunchAt,
     launchedAt,

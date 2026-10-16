@@ -43,24 +43,20 @@ Set these in `.env.local` and in the Vercel project. Do not prefix them with `NE
 | `SUBHUB_API_USERNAME` | No | Service-user username for Basic auth or Sanctum login. |
 | `SUBHUB_API_PASSWORD` | No | Service-user password. |
 | `SUBHUB_API_KEY_HEADER` | No | Header for the key in `basic+key`. Defaults to `X-API-Key`. |
-| `SUBHUB_LOGIN_PATH` | No | Optional Sanctum login path. Blank disables that fallback. |
+| `SUBHUB_LOGIN_PATH` | No | Sanctum path tried first. Blank tries `/api/login`, `/api/v1/login`, and `/api/auth/login`. |
 | `SUBHUB_LOGIN_USERNAME_FIELD` | No | JSON field for the username. Defaults to `email`. |
 | `SUBHUB_LOGIN_PASSWORD_FIELD` | No | JSON field for the password. Defaults to `password`. |
-| `SUBHUB_LOGIN_KEY_FIELD` | No | JSON field for the key on login. Defaults to `key`. Blank omits it. |
-| `SUBHUB_LOGIN_DEVICE_NAME` | No | Sanctum `device_name`. Defaults to `cxm-dashboard`. |
+| `SUBHUB_LOGIN_KEY_FIELD` | No | Optional JSON field for a key. Blank omits it. |
+| `SUBHUB_LOGIN_DEVICE_NAME` | No | Optional Sanctum `device_name`. Blank omits it. |
 | `DASHBOARD_PASSWORD` | No | Turns on the placeholder password gate. When it is empty, the app is open and says so. |
 
-`auto` picks the first mode it can fill, in this order:
+`auto` uses Laravel Sanctum when `SUBHUB_API_USERNAME` and `SUBHUB_API_PASSWORD` are set. HTTP Basic is not used in auto mode: the API answers it with the HTML login page. A key alone still uses `Authorization: Bearer`. Set `SUBHUB_AUTH_MODE` to `basic` or `basic+key` only to force Basic.
 
-1. `basic+key` when username, password, and key are all set. This matches the browser prompt on the API URL plus the service key. The password is `Authorization: Basic`, and the key goes in `SUBHUB_API_KEY_HEADER` because one Authorization header cannot hold both.
-2. `basic` when username and password are set.
-3. `bearer` when only the key is set (`Authorization: Bearer`).
+Login POSTs `{email, password}` (the username field defaults to `email`) and sends `Accept: application/json`. It tries `SUBHUB_LOGIN_PATH` first when that is set, then `/api/login`, `/api/v1/login`, and `/api/auth/login`, and stops at the first JSON body that contains a token (`token`, `access_token`, `data.token`, and the same names one level down). A 401 or 403 stops the search. HTML and 404 responses are recorded and the next path is tried. The token is cached in memory and sent as `Authorization: Bearer` on later calls, which also send `Accept: application/json`. A 401 on an API call refreshes the token once.
 
-Sanctum login is optional. It runs only when `SUBHUB_AUTH_MODE=login`, or when mode is `auto`, `SUBHUB_LOGIN_PATH` is set, and the earlier mode returns 401. The token is cached in memory. A 401 refreshes it once and retries once. Explicit `login` with a blank path uses `/api/login`.
+`GET /api/health` reports `demo`, `connected`, `auth failed`, or `unexpected body`, plus the auth mode. Login attempts are listed with path, upstream status, content type, and top-level keys. The token and the password are never included. When the orgs call answers, the JSON also includes `upstreamStatus`, `contentType`, `bodyKind`, `topLevelKeys`, `recordCount`, and a short `detail`. HTTP 200 is demo, connected, or an unexpected body you can paste back. HTTP 401 means login did not yield a usable token. HTTP 503 means the API could not be reached.
 
-`GET /api/health` reports `demo`, `connected`, `auth failed`, or `unexpected body`, plus the auth mode that was tried. When the API answers, the JSON also includes `upstreamStatus`, `contentType`, `bodyKind`, `topLevelKeys`, `recordCount`, and a short `detail`. HTML is described by its title and markers such as `form` or `password-field`. JSON detail lists keys, not record values. The route does not return credentials, tokens, or response bodies. HTTP 200 is demo, connected, or an unexpected body you can paste back. HTTP 401 is a rejected login. HTTP 503 means the API could not be reached. The route stays available when the dashboard password is set.
-
-The list parser accepts a top-level array, `data`, `orgs`, `results`, `projects`, a nested `results.data` cursor page, and a Laravel paginator (`data`, `links`, `meta`, `next_cursor`, or `page`). If the body is HTML, unrecognized JSON, or any other API error, every page stays up on labeled demo data and the banner quotes the sanitized error.
+Org and project lists use the superadmin wrapper `results.data`, with `results.next_cursor` sent back as `?cursor=`. Flat org fields (`street`, `city`, `state`, `postal_code`, `country`) and plan names are mapped. `Sales and Referrals Monthly` is the $500 monthly plan. `Solar Per Contract Sign` is the $35 per-contract plan. Other list shapes still parse. If the body is HTML, unrecognized JSON, or any other API error, every page stays up on labeled demo data and the banner quotes the sanitized error.
 
 Credentials are read only in server modules (`lib/api/client.ts` imports `server-only`). They are not sent to the browser. Errors include the status code, content type, body kind, top-level keys, and a short sanitized snippet. Secrets and email addresses are redacted.
 
@@ -101,16 +97,16 @@ Health v1 scores volume (75) and billing (25). Through day 60, volume follows pa
 npm test
 ```
 
-Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, API auth, response-shape parsing, sanitized API errors, and the demo fallback when the API body cannot be used.
+Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, API auth, Sanctum login paths, `results.data` cursor pagination, plan and address mapping, sanitized API errors, and the demo fallback when the API body cannot be used.
 
 ## Deploy on Vercel
 
 1. Import this repository. Framework preset is Next.js. Do not set a custom build command.
 2. In Project Settings → Environment Variables, set `SUBHUB_API_BASE_URL` to `https://app.subcontractorhub.com` (that is also the default).
-3. For a live environment, set `SUBHUB_API_USERNAME`, `SUBHUB_API_PASSWORD`, and `SUBHUB_API_KEY`. Leave `SUBHUB_AUTH_MODE` as `auto` so the app sends Basic auth plus the key header. Leave all three unset on Preview if that deployment should stay on demo data. Put secrets in the Vercel UI. Do not paste them into chat or commit them.
-4. Set `SUBHUB_LOGIN_PATH` only if the Basic prompt is not the real gate and a Sanctum login request is required.
+3. For a live environment, set `SUBHUB_API_USERNAME` to the Executive Leadership Read Only user's email and set `SUBHUB_API_PASSWORD`. Leave `SUBHUB_AUTH_MODE` as `auto`. Leave both unset on Preview if that deployment should stay on demo data. Put secrets in the Vercel UI. Do not paste them into chat or commit them.
+4. Set `SUBHUB_LOGIN_PATH` only when you already know which Sanctum path works. Otherwise leave it blank and read `loginAttempts` from `/api/health`.
 5. Set `DASHBOARD_PASSWORD` on any deployment other people can open. This is a placeholder until Google SSO and a role list (admin, CX leader, support, CXM).
-6. Deploy. `npm run build` is the production build. Open `/api/health` and expect `{"status":"connected","mode":"basic+key"}` when the service user is set.
+6. Deploy. `npm run build` is the production build. Open `/api/health` and expect `status: "connected"`, `mode: "login"`, and a `loginPath` when the service user is set.
 
 There is no cron sync and no database in this phase. Each request reads the API, or demo data, and applies any manual dates saved on that instance.
 
