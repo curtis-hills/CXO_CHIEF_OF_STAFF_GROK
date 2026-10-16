@@ -11,6 +11,7 @@ export { redactSecrets };
 export const DEFAULT_BASE_URL = "https://app.subcontractorhub.com";
 export const DEFAULT_KEY_HEADER = "X-API-Key";
 export const DEFAULT_LOGIN_PATH = "/api/login";
+export const DEFAULT_LOGIN_PATHS = ["/api/login", "/api/v1/login", "/api/auth/login"] as const;
 
 export type AuthModeName = "bearer" | "basic" | "basic+key" | "login";
 export type AuthModeSetting = "auto" | AuthModeName;
@@ -30,6 +31,14 @@ export type ApiAuthConfig = {
   loginDeviceName: string;
 };
 
+export type LoginAttemptReport = {
+  path: string;
+  upstreamStatus: number;
+  contentType: string;
+  bodyKind: "html" | "json" | "text" | "empty";
+  topLevelKeys: string[];
+};
+
 export type ConnectionReport = {
   status: "demo" | "connected" | "auth failed" | "unexpected body";
   mode?: AuthModeName;
@@ -40,6 +49,10 @@ export type ConnectionReport = {
   topLevelKeys?: string[];
   recordCount?: number | null;
   detail?: string;
+  /** Login path that returned a token. */
+  loginPath?: string;
+  /** Each Sanctum login path that was tried. Never includes the token or password. */
+  loginAttempts?: LoginAttemptReport[];
 };
 
 export class AuthRejectedError extends Error {
@@ -69,8 +82,8 @@ export function readApiAuthConfig(env: EnvSource): ApiAuthConfig {
     loginPath: env.SUBHUB_LOGIN_PATH?.trim() ?? "",
     loginUsernameField: env.SUBHUB_LOGIN_USERNAME_FIELD?.trim() || "email",
     loginPasswordField: env.SUBHUB_LOGIN_PASSWORD_FIELD?.trim() || "password",
-    loginKeyField: env.SUBHUB_LOGIN_KEY_FIELD?.trim() ?? "key",
-    loginDeviceName: env.SUBHUB_LOGIN_DEVICE_NAME?.trim() || "cxm-dashboard",
+    loginKeyField: env.SUBHUB_LOGIN_KEY_FIELD?.trim() ?? "",
+    loginDeviceName: env.SUBHUB_LOGIN_DEVICE_NAME?.trim() ?? "",
   };
 }
 
@@ -89,17 +102,27 @@ export function credentialsReady(config: ApiAuthConfig, mode: AuthModeName): boo
 }
 
 /**
- * Auto order: basic+key, then basic, then bearer.
- * Login is not selected here; it is only an optional 401 fallback.
+ * Auto order: Sanctum login when a username and password are set, otherwise bearer.
+ * HTTP Basic is not selected. The API answers Basic with the HTML login page.
+ * Set SUBHUB_AUTH_MODE to basic or basic+key to send Basic anyway.
  */
 export function primaryMode(config: ApiAuthConfig): AuthModeName | null {
   if (config.mode === "auto") {
-    if (credentialsReady(config, "basic+key")) return "basic+key";
-    if (credentialsReady(config, "basic")) return "basic";
+    if (credentialsReady(config, "login")) return "login";
     if (credentialsReady(config, "bearer")) return "bearer";
     return null;
   }
   return credentialsReady(config, config.mode) ? config.mode : null;
+}
+
+/** Configured path first, then the common Sanctum paths that are not already listed. */
+export function loginPaths(config: ApiAuthConfig): string[] {
+  const paths: string[] = [];
+  if (config.loginPath) paths.push(config.loginPath);
+  for (const path of DEFAULT_LOGIN_PATHS) {
+    if (!paths.includes(path)) paths.push(path);
+  }
+  return paths;
 }
 
 export function connectionIntent(config: ApiAuthConfig): "demo" | "ready" | "incomplete" {
@@ -110,8 +133,7 @@ export function connectionIntent(config: ApiAuthConfig): "demo" | "ready" | "inc
 
 function loginFallbackEnabled(config: ApiAuthConfig): boolean {
   if (!config.username || !config.password) return false;
-  if (config.mode === "login") return true;
-  return config.mode === "auto" && config.loginPath.length > 0;
+  return config.mode === "basic" || config.mode === "basic+key";
 }
 
 function normalizeBase(value: string): string {
@@ -128,8 +150,7 @@ function normalizeBase(value: string): string {
   }
 }
 
-function loginUrl(config: ApiAuthConfig): string {
-  const path = config.mode === "login" && !config.loginPath ? DEFAULT_LOGIN_PATH : config.loginPath;
+function loginUrl(config: ApiAuthConfig, path: string): string {
   if (!path.startsWith("/") || path.startsWith("//") || path.includes("\\") || /\s/.test(path)) {
     throw new Error("SUBHUB_LOGIN_PATH must be a path on the API host.");
   }
@@ -162,6 +183,8 @@ export class ApiSession {
   private inflight: Promise<string> | null = null;
   private inflightGeneration = 0;
   private generation = 0;
+  private loginPathUsed: string | null = null;
+  private loginAttempts: LoginAttemptReport[] = [];
 
   constructor(
     private readonly config: ApiAuthConfig,
@@ -190,16 +213,26 @@ export class ApiSession {
         topLevelKeys: summary.topLevelKeys,
         recordCount: summary.recordCount,
         detail: summary.detail,
+        ...this.loginMeta(),
       };
       if (response.status === 401 || response.status === 403) return { status: "auth failed", httpStatus: 401, ...diagnostic };
       if (!response.ok) return { status: "auth failed", httpStatus: 503, ...diagnostic };
       if (summary.bodyKind === "json" && summary.recordCount !== null) return { status: "connected", httpStatus: 200, ...diagnostic };
       return { status: "unexpected body", httpStatus: 200, ...diagnostic };
     } catch (error) {
-      if (error instanceof AuthRejectedError) return { status: "auth failed", httpStatus: 401 };
-      if (error instanceof Error && /credentials are not valid|AUTH_MODE|KEY_HEADER/.test(error.message)) throw error;
-      return { status: "auth failed", httpStatus: 503 };
+      const meta = { mode: primaryMode(this.config) ?? undefined, ...this.loginMeta() };
+      if (error instanceof AuthRejectedError) return { status: "auth failed", httpStatus: 401, ...meta };
+      if (error instanceof Error && /credentials are not valid|AUTH_MODE|KEY_HEADER|API host/.test(error.message)) throw error;
+      return { status: "auth failed", httpStatus: 503, ...meta };
     }
+  }
+
+  private loginMeta(): { loginPath?: string; loginAttempts?: LoginAttemptReport[] } {
+    if (this.loginAttempts.length === 0) return {};
+    return {
+      ...(this.loginPathUsed ? { loginPath: this.loginPathUsed } : {}),
+      loginAttempts: this.loginAttempts,
+    };
   }
 
   private async requestWithMode(
@@ -282,19 +315,43 @@ export class ApiSession {
     }
   }
 
-  private async login(): Promise<string> {
+  private loginBody(): Record<string, string> {
     const body: Record<string, string> = {
       [this.config.loginUsernameField]: this.config.username,
       [this.config.loginPasswordField]: this.config.password,
     };
     if (this.config.loginDeviceName) body.device_name = this.config.loginDeviceName;
     if (this.config.loginKeyField && this.config.apiKey) body[this.config.loginKeyField] = this.config.apiKey;
+    return body;
+  }
+
+  private async login(): Promise<string> {
+    this.loginAttempts = [];
+    this.loginPathUsed = null;
+    let rejected = false;
+    for (const path of loginPaths(this.config)) {
+      const result = await this.postLogin(path);
+      this.loginAttempts.push(result.attempt);
+      if (result.token) {
+        this.loginPathUsed = path;
+        return result.token;
+      }
+      if (result.rejected) {
+        rejected = true;
+        break;
+      }
+    }
+    if (rejected) throw new AuthRejectedError();
+    throw new AuthRejectedError();
+  }
+
+  private async postLogin(path: string): Promise<{ token: string | null; rejected: boolean; attempt: LoginAttemptReport }> {
     let response: Response;
     try {
-      response = await this.fetchImpl(loginUrl(this.config), {
+      response = await this.fetchImpl(loginUrl(this.config, path), {
         method: "POST",
         headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(this.loginBody()),
         cache: "no-store",
         redirect: "manual",
       });
@@ -302,15 +359,18 @@ export class ApiSession {
       const message = error instanceof Error ? error.message : "SubcontractorHub login failed.";
       throw new Error(redactSecrets(message, [this.config.apiKey, this.config.password]));
     }
-    if (response.status === 401 || response.status === 403) {
-      await discard(response);
-      throw new AuthRejectedError();
-    }
     const text = await response.text();
-    if (!response.ok) throw new Error(`SubcontractorHub login failed (${response.status}).`);
-    const token = extractToken(text);
-    if (!token) throw new AuthRejectedError();
-    return token;
+    const { summary } = inspectResponse(response.headers.get("content-type"), text, [this.config.password, this.config.apiKey]);
+    const attempt: LoginAttemptReport = {
+      path,
+      upstreamStatus: response.status,
+      contentType: summary.contentType,
+      bodyKind: summary.bodyKind,
+      topLevelKeys: summary.topLevelKeys,
+    };
+    if (response.status === 401 || response.status === 403) return { token: null, rejected: true, attempt };
+    if (!response.ok) return { token: null, rejected: false, attempt };
+    return { token: extractToken(text), rejected: false, attempt };
   }
 }
 

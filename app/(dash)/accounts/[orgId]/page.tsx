@@ -44,7 +44,9 @@ export default async function AccountPage({
         </div>
         <h1 className="mt-3 font-serif text-[2rem] leading-tight">{account.name}</h1>
         <p className="mt-1 text-sm text-muted">
-          {account.city ? `${account.city}, ${account.state}` : "No address"}
+          {account.city || account.state || account.postalCode
+            ? [ [account.city, account.state].filter(Boolean).join(", "), account.postalCode ].filter(Boolean).join(" ")
+            : "No address"}
           {account.email ? ` · ${account.email}` : ""}
           {account.products.length ? ` · ${account.products.join(", ")}` : ""}
         </p>

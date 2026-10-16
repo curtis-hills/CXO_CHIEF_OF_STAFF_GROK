@@ -6,8 +6,9 @@ import {
   SubhubApiError,
 } from "../lib/api/body";
 import { healthPayload } from "../lib/api/health-payload";
-import { resetApiSession } from "../lib/api/client";
+import { fetchOrgs, resetApiSession } from "../lib/api/client";
 import { ApiSession, type ApiAuthConfig } from "../lib/api/session";
+import { assemblePortfolio } from "../lib/data/assemble";
 import { readPortfolio } from "../lib/data/load";
 
 const PASSWORD = "super-secret-password";
@@ -41,6 +42,15 @@ describe("API response shapes", () => {
       items: [{ id: 5 }],
       next: { cursor: "n5" },
     });
+    expect(
+      collectionFromPayload({
+        results: {
+          data: [{ id: 6 }],
+          next_cursor: null,
+          next_page_url: "https://app.subcontractorhub.com/api/v1/superadmin/orgs?cursor=from-url",
+        },
+      })?.next,
+    ).toEqual({ cursor: "from-url" });
 
     const pages = [
       {
@@ -126,6 +136,104 @@ describe("API response shapes", () => {
       topLevelKeys: ["data", "links", "meta"],
       recordCount: 2,
     });
+  });
+});
+
+describe("documented org payload", () => {
+  it("follows results.next_cursor with the cursor query parameter", async () => {
+    process.env.SUBHUB_API_USERNAME = "cxm-service";
+    process.env.SUBHUB_API_PASSWORD = PASSWORD;
+    process.env.SUBHUB_API_KEY = "";
+    process.env.SUBHUB_AUTH_MODE = "login";
+    process.env.SUBHUB_LOGIN_PATH = "/api/v1/login";
+    process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
+    resetApiSession();
+    const urls: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      urls.push(`${init?.method ?? "GET"} ${url}`);
+      if ((init?.method ?? "GET") === "POST") return Response.json({ token: "cached-token" });
+      if (!url.includes("cursor=")) {
+        return Response.json({
+          results: {
+            data: [{ id: "org_a", name: "First" }],
+            path: "https://app.subcontractorhub.com/api/v1/superadmin/orgs",
+            per_page: 50,
+            next_cursor: "cursor-1",
+            next_page_url: "https://app.subcontractorhub.com/api/v1/superadmin/orgs?cursor=cursor-1",
+            prev_cursor: null,
+            prev_page_url: null,
+          },
+        });
+      }
+      return Response.json({
+        results: {
+          data: [{ id: "org_b", name: "Second" }],
+          next_cursor: null,
+          next_page_url: null,
+          prev_cursor: "cursor-1",
+          prev_page_url: null,
+        },
+      });
+    };
+    try {
+      const orgs = await fetchOrgs();
+      expect(orgs.map((org) => org.id)).toEqual(["org_a", "org_b"]);
+      const orgGets = urls.filter((url) => url.includes("/superadmin/orgs"));
+      expect(orgGets[0]).not.toContain("cursor=");
+      expect(orgGets[1]).toContain("cursor=cursor-1");
+    } finally {
+      globalThis.fetch = original;
+      delete process.env.SUBHUB_API_USERNAME;
+      delete process.env.SUBHUB_API_PASSWORD;
+      delete process.env.SUBHUB_API_KEY;
+      delete process.env.SUBHUB_AUTH_MODE;
+      delete process.env.SUBHUB_LOGIN_PATH;
+      delete process.env.SUBHUB_API_BASE_URL;
+      resetApiSession();
+    }
+  });
+
+  it("maps flat address fields and the documented plan names", () => {
+    const assembled = assemblePortfolio({
+      mode: "live",
+      asOf: "2026-10-16T00:00:00.000Z",
+      orgs: [
+        {
+          id: 9,
+          name: "Northwind Solar",
+          email: "ops@northwind.example",
+          status: "Launched",
+          payment_status: "paid",
+          street: "1 Main St",
+          city: "Phoenix",
+          state: "AZ",
+          postal_code: "85001",
+          country: "US",
+          products: ["Solar"],
+          active_user_count: 3,
+          subscriptions: [
+            { status: "active", plan: { id: 1, name: "Sales and Referrals Monthly", unit_price: 500, interval: "month" } },
+            { status: "active", plan: { id: 2, name: "Solar Per Contract Sign", unit_price: "35.00", interval: null } },
+          ],
+        },
+      ],
+      projectsByOrg: { "9": [] },
+      proxies: {},
+      overrides: {},
+    });
+    const account = assembled.accounts[0];
+    expect(account?.city).toBe("Phoenix");
+    expect(account?.state).toBe("AZ");
+    expect(account?.postalCode).toBe("85001");
+    expect(account?.street).toBe("1 Main St");
+    expect(account?.country).toBe("US");
+    expect(account?.accountType).toBe("sales_org");
+    expect(account?.subscriptions).toEqual([
+      { status: "active", planName: "Sales and Referrals Monthly", unitPrice: 500, interval: "month" },
+      { status: "active", planName: "Solar Per Contract Sign", unitPrice: 35, interval: "contract" },
+    ]);
   });
 });
 

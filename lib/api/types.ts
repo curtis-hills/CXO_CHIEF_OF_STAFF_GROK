@@ -22,6 +22,12 @@ export type ApiOrg = {
   status?: string | null;
   sub_status?: string | null;
   payment_status?: string | null;
+  /** Flat address fields on the superadmin org payload. */
+  street?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postal_code?: string | null;
+  country?: string | null;
   address?: {
     street?: string | null;
     city?: string | null;

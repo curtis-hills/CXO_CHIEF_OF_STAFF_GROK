@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { healthPayload } from "../lib/api/health-payload";
 import {
   ApiSession,
   basicAuthorization,
@@ -21,8 +22,8 @@ function config(overrides: Partial<ApiAuthConfig> = {}): ApiAuthConfig {
     loginPath: "",
     loginUsernameField: "email",
     loginPasswordField: "password",
-    loginKeyField: "key",
-    loginDeviceName: "cxm-dashboard",
+    loginKeyField: "",
+    loginDeviceName: "",
     ...overrides,
   };
 }
@@ -88,56 +89,82 @@ describe("API auth", () => {
     expect(JSON.stringify(report)).not.toContain(API_KEY);
   });
 
-  it("auto-selects basic+key when username, password, and key are all set", async () => {
-    const methods: string[] = [];
-    const session = new ApiSession(config(), async (url, init) => {
-      methods.push(`${init?.method ?? "GET"} ${url}`);
+  it("auto logs in with Sanctum when username and password are set, and uses bearer when only the key is set", async () => {
+    const posts: string[] = [];
+    const login = new ApiSession(config({ apiKey: "" }), async (url, init) => {
+      expect(headersOf(init).get("accept")).toBe("application/json");
+      if ((init?.method ?? "GET") === "POST") {
+        posts.push(new URL(url).pathname);
+        expect(JSON.parse(String(init?.body))).toEqual({ email: "cxm-service", password: PASSWORD });
+        return json({ token: "cached-token-1" });
+      }
+      expect(headersOf(init).get("authorization")).toBe("Bearer cached-token-1");
       return json({ results: { data: [] } });
     });
-    const report = await session.probe();
-    expect(report.mode).toBe("basic+key");
-    expect(methods).toHaveLength(1);
-    expect(methods[0]).toMatch(/^GET /);
-  });
-
-  it("auto-selects basic when no key is set, and bearer when only the key is set", async () => {
-    const basic = new ApiSession(config({ apiKey: "" }), async () => json({ ok: true }));
-    const bearer = new ApiSession(config({ username: "", password: "" }), async () => json({ ok: true }));
-    expect((await basic.probe()).mode).toBe("basic");
+    const bearer = new ApiSession(config({ username: "", password: "" }), async (_url, init) => {
+      expect(headersOf(init).get("accept")).toBe("application/json");
+      expect(headersOf(init).get("authorization")).toBe(`Bearer ${API_KEY}`);
+      return json({ results: { data: [] } });
+    });
+    expect((await login.probe()).mode).toBe("login");
+    expect(posts).toEqual(["/api/login"]);
     expect((await bearer.probe()).mode).toBe("bearer");
   });
 
-  it("does not fall back to Sanctum login unless a login path is configured", async () => {
-    let posts = 0;
-    const session = new ApiSession(config(), async (_url, init) => {
-      if ((init?.method ?? "GET") === "POST") posts += 1;
-      return new Response("no", { status: 401 });
+  it("stops after a 401 from the first login path", async () => {
+    const posts: string[] = [];
+    const session = new ApiSession(config({ apiKey: "" }), async (url, init) => {
+      if ((init?.method ?? "GET") === "POST") posts.push(new URL(url).pathname);
+      return new Response(JSON.stringify({ message: PASSWORD }), { status: 401, headers: { "content-type": "application/json" } });
     });
     const report = await session.probe();
-    expect(report).toMatchObject({ status: "auth failed", httpStatus: 401, mode: "basic+key" });
-    expect(posts).toBe(0);
+    expect(report).toMatchObject({ status: "auth failed", httpStatus: 401, mode: "login" });
+    expect(posts).toEqual(["/api/login"]);
+    expect(JSON.stringify(report)).not.toContain(PASSWORD);
   });
 
-  it("falls back to Sanctum login after a 401 when the login path is set", async () => {
-    const calls: string[] = [];
-    const session = new ApiSession(config({ loginPath: "/api/login" }), async (url, init) => {
-      calls.push(`${init?.method ?? "GET"} ${url}`);
+  it("tries the configured login path first, then the defaults, and reports them without the token", async () => {
+    const posts: string[] = [];
+    const session = new ApiSession(config({ apiKey: "", loginPath: "/custom/login" }), async (url, init) => {
+      expect(headersOf(init).get("accept")).toBe("application/json");
       if ((init?.method ?? "GET") === "POST") {
+        const path = new URL(url).pathname;
+        posts.push(path);
         const body = JSON.parse(String(init?.body));
-        expect(body.email).toBe("cxm-service");
-        expect(body.password).toBe(PASSWORD);
-        expect(body.key).toBe(API_KEY);
-        expect(body.device_name).toBe("cxm-dashboard");
-        return json({ token: "cached-token-1" });
+        expect(body).toEqual({ email: "cxm-service", password: PASSWORD });
+        if (path === "/custom/login") {
+          return new Response("<html><title>Login</title><form></form></html>", {
+            status: 200,
+            headers: { "content-type": "text/html" },
+          });
+        }
+        if (path === "/api/login") return new Response("missing", { status: 404, headers: { "content-type": "application/json" } });
+        if (path === "/api/v1/login") return json({ data: { access_token: "sanctum-plain-9f3c" } });
+        return new Response("no", { status: 404 });
       }
-      const authorization = headersOf(init).get("authorization") ?? "";
-      if (authorization.startsWith("Basic ")) return new Response("no", { status: 401 });
-      expect(authorization).toBe("Bearer cached-token-1");
-      return json({ results: { data: [] } });
+      expect(headersOf(init).get("authorization")).toBe("Bearer sanctum-plain-9f3c");
+      return json({
+        results: {
+          data: [{ id: 1 }],
+          next_cursor: null,
+          next_page_url: null,
+        },
+      });
     });
     const report = await session.probe();
-    expect(report).toMatchObject({ status: "connected", mode: "login", httpStatus: 200 });
-    expect(calls.filter((call) => call.startsWith("POST"))).toHaveLength(1);
+    expect(posts).toEqual(["/custom/login", "/api/login", "/api/v1/login"]);
+    expect(report).toMatchObject({ status: "connected", mode: "login", loginPath: "/api/v1/login" });
+    expect(report.loginAttempts).toEqual([
+      expect.objectContaining({ path: "/custom/login", upstreamStatus: 200, contentType: "text/html", bodyKind: "html" }),
+      expect.objectContaining({ path: "/api/login", upstreamStatus: 404, bodyKind: "text" }),
+      expect.objectContaining({ path: "/api/v1/login", upstreamStatus: 200, contentType: "application/json", topLevelKeys: ["data"] }),
+    ]);
+    expect(JSON.stringify(report)).not.toContain("sanctum-plain-9f3c");
+    expect(JSON.stringify(report)).not.toContain(PASSWORD);
+    const pasted = healthPayload(report);
+    expect(pasted.loginPath).toBe("/api/v1/login");
+    expect(pasted.loginAttempts).toHaveLength(3);
+    expect(JSON.stringify(pasted)).not.toContain("sanctum-plain-9f3c");
   });
 
   it("caches the Sanctum token and re-logins only once after a 401", async () => {
