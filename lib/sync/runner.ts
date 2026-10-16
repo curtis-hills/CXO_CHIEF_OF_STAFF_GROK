@@ -8,18 +8,20 @@ import { ENDPOINTS, endpointById, type EndpointId } from "./catalog";
 import { PAGE_SIZE } from "../api/limits";
 import {
   advanceHighWater,
-  cursorStallMessage,
+  cursorToPersist,
   nextOffsetPage,
   paceDelayMs,
   pacificDay,
   pageOrder,
   pageRepeated,
+  parseTieCursor,
   resumeAdvanced,
   rowIds,
   selectSyncQuery,
   shouldFullReconcile,
   splitAtHighWater,
-  type ResumeToken,
+  tieAdvanced,
+  timestampCursorMs,
 } from "./high-water";
 import { ensureMigrations } from "../db/migrate";
 import { databaseUrl } from "../db/sql";
@@ -143,7 +145,6 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
   let runEndpoint: EndpointId | null = null;
   let runRows = 0;
   let runPages = 0;
-  let runToken: ResumeToken | null = null;
   let runCount = 0;
   const trail = { ids: [] as string[] };
 
@@ -162,8 +163,6 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
       runRows = 0;
       runPages = 0;
       trail.ids = [];
-      const starting = states.get(next)!;
-      runToken = { cursor: starting.cursor, page: starting.page };
       runCount = await store.rowCount(next);
       runId = crypto.randomUUID();
       await store.insertRun({
@@ -197,17 +196,16 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
     }
   }
 
-  if (runEndpoint && runToken && !hardError && status === "ok") {
+  if (runEndpoint && !hardError && status === "ok") {
     const endState = states.get(runEndpoint)!;
-    const endToken = { cursor: endState.cursor, page: endState.page };
     const grew = (await store.rowCount(runEndpoint)) > runCount;
-    if (!endState.backfillComplete && !endState.disabled && runPages > 0 && !resumeAdvanced(runToken, endToken) && !grew) {
-      endState.lastError = cursorStallMessage(runEndpoint);
+    // A page walk that was just armed still has to be fetched. Completing here
+    // would drop that attempt. A run that already fetched its pages and stored
+    // nothing — cursor text can change on a tie or a tail reset — is finished.
+    const armedPage = endState.page != null && endState.cursor == null;
+    if (!endState.backfillComplete && !endState.disabled && runPages > 0 && !grew && !armedPage) {
+      finishPass(endState, now);
       await store.saveCursor(runEndpoint, endState);
-      hardError = true;
-      status = "error";
-      error = endState.lastError;
-      console.error(`CXM sync failed: ${error}`);
     }
   }
 
@@ -316,6 +314,15 @@ async function pullPage(
       await store.saveCursor(id, state);
       return { rows: 0, countedPage: false, status: "ok", error: state.lastError, hardError: false, sleep: false, delayMs: 0 };
     }
+    if (error instanceof SubhubApiError && error.status === 422 && parseTieCursor(state.cursor)) {
+      // The list did not accept updated_at|id. Keep the rows and walk by page.
+      const storedRows = await store.rowCount(id);
+      state.cursor = null;
+      state.page = Math.max(2, nextOffsetPage(storedRows, PAGE_SIZE));
+      state.lastError = null;
+      await store.saveCursor(id, state);
+      return { rows: 0, countedPage: false, status: "ok", error: null, hardError: false, sleep: true, delayMs: 0 };
+    }
     if (error instanceof SubhubApiError && error.status === 404 && !endpoint.required) {
       state.disabled = true;
       state.passComplete = true;
@@ -363,20 +370,27 @@ async function pullPage(
       ? splitAtHighWater(items, state.highWater, order)
       : { fresh: items, reached: false };
   const ids = rowIds(items);
-  const requested: ResumeToken = { cursor: state.cursor, page: state.page };
+  const requestedCursor = state.cursor;
+  const requestedTie = parseTieCursor(requestedCursor);
   const offsetMode = state.page != null && state.cursor == null;
-  const returned: ResumeToken | null = page.next
-    ? { cursor: page.next.cursor ?? null, page: page.next.page ?? null }
-    : null;
-  const before = offsetMode ? await store.rowCount(id) : 0;
+  const returnedCursor = page.next?.cursor ?? null;
+  const returnedPage = page.next?.page ?? null;
+  const before = await store.rowCount(id);
   const stored = await storeRows(store, id, split.fresh);
-  const inserted = offsetMode ? (await store.rowCount(id)) - before : null;
+  const inserted = (await store.rowCount(id)) - before;
+  const movedTie = tieAdvanced(requestedTie, items);
   state.highWater = advanceHighWater(state.highWater, split.fresh);
   const delayMs = paceDelayMs(page.rateLimit?.remaining ?? null, page.rateLimit?.reset ?? null);
+  const sameWatermark =
+    timestampCursorMs(requestedCursor) != null &&
+    timestampCursorMs(returnedCursor) != null &&
+    timestampCursorMs(requestedCursor) === timestampCursorMs(returnedCursor);
   const tokenStuck =
-    returned != null &&
-    (requested.cursor != null || requested.page != null) &&
-    !resumeAdvanced(requested, returned);
+    returnedCursor != null &&
+    (requestedCursor != null || state.page != null) &&
+    (sameWatermark ||
+      (!resumeAdvanced({ cursor: requestedCursor, page: state.page }, { cursor: returnedCursor, page: returnedPage }) &&
+        !movedTie));
   const rowsStuck = pageRepeated(trail.ids, ids);
 
   const ok = (sleep: boolean): PageOutcome => ({
@@ -395,8 +409,25 @@ async function pullPage(
     await store.saveCursor(id, state);
     return ok(false);
   }
-  if (offsetMode && inserted === 0 && items.length > 0) {
-    return stall(store, id, state, stored);
+
+  // Same rows with a cursor that still points at them: a shared updated_at, or
+  // next_cursor wrapping to the start of the list. Try one page step first.
+  // If that page is already stored, the list is at its end — mark it complete
+  // so the next endpoint can run in this same invocation.
+  const exhausted = inserted === 0 && items.length > 0 && !movedTie && Boolean(page.next);
+  if (exhausted && !offsetMode) {
+    state.cursor = null;
+    state.page = Math.max(2, nextOffsetPage(before, PAGE_SIZE));
+    state.lastError = null;
+    trail.ids = ids;
+    await store.saveCursor(id, state);
+    return ok(true);
+  }
+  if (exhausted && offsetMode) {
+    await finishList(store, state, now);
+    trail.ids = ids;
+    await store.saveCursor(id, state);
+    return ok(false);
   }
 
   const done = split.reached || !page.next;
@@ -408,20 +439,24 @@ async function pullPage(
     if (state.orgIndex >= orgIds.length) finishPass(state, now);
   } else if (done) {
     finishPass(state, now);
+  } else if (!offsetMode && inserted > 0 && returnedCursor && (sameWatermark || requestedTie)) {
+    // The watermark instant did not move. Attach the last id so the next
+    // request can step through the tie instead of reading this page again.
+    state.cursor = cursorToPersist(returnedCursor, items);
+    state.page = null;
+    state.lastError = null;
   } else if (!offsetMode && (tokenStuck || rowsStuck)) {
-    // The API handed back the same cursor, usually a shared updated_at used as
-    // a >= watermark. Keep the rows already stored and walk the list by page.
     const storedRows = await store.rowCount(id);
     state.cursor = null;
-    state.page = nextOffsetPage(storedRows, PAGE_SIZE);
+    state.page = Math.max(2, nextOffsetPage(storedRows, PAGE_SIZE));
     state.lastError = null;
   } else if (offsetMode) {
     state.page = (state.page ?? 1) + 1;
     state.cursor = null;
     state.lastError = null;
   } else {
-    state.cursor = returned?.cursor ?? null;
-    state.page = returned?.page ?? null;
+    state.cursor = cursorToPersist(returnedCursor, items);
+    state.page = returnedPage;
     state.lastError = null;
   }
   trail.ids = ids;
@@ -439,20 +474,6 @@ async function finishList(store: SyncStore, state: CursorState, now: Date): Prom
     return;
   }
   finishPass(state, now);
-}
-
-function stall(store: SyncStore, id: EndpointId, state: CursorState, stored: number): Promise<PageOutcome> {
-  state.lastError = cursorStallMessage(id);
-  console.error(`CXM sync failed: ${state.lastError}`);
-  return store.saveCursor(id, state).then(() => ({
-    rows: stored,
-    countedPage: true,
-    status: "error" as const,
-    error: state.lastError,
-    hardError: true,
-    sleep: false,
-    delayMs: 0,
-  }));
 }
 
 function finishPass(state: CursorState, now: Date): void {
