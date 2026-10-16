@@ -12,6 +12,7 @@ const LINKS = [
   { href: "/agents", label: "Agents" },
   { href: "/engineering", label: "Engineering" },
   { href: "/sync", label: "Sync" },
+  { href: "/data-profile", label: "Data profile" },
 ];
 
 export function SideNav({ alertCount }: { alertCount: number }) {
