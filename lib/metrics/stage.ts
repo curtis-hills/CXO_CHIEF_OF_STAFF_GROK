@@ -67,6 +67,22 @@ function span(
   };
 }
 
+/**
+ * Clock that put a pre-launch account past a flag.
+ * The current stage wins when it is red. Otherwise the total Onboarding → Launched clock is used,
+ * so a green "2 bd" in Ready to Launch does not hide a total clock past 7 business days.
+ */
+export function flaggedClock(timing: StageTiming): { tone: SlaTone; businessDays: number } | null {
+  if (timing.inStageTone === "red" && timing.businessDaysInStage !== null) {
+    return { tone: "red", businessDays: timing.businessDaysInStage };
+  }
+  const total = timing.onboardingToLaunched;
+  if (total.tone === "red" && total.businessDays !== null) {
+    return { tone: "red", businessDays: total.businessDays };
+  }
+  return null;
+}
+
 export function evaluateStage(input: {
   stage: StageName;
   onboardingAt: string | null;

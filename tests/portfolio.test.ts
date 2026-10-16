@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { assemblePortfolio } from "../lib/data/assemble";
 import { buildMockInputs } from "../lib/data/mock";
 import { subtractCalendarDays } from "../lib/metrics/calendar";
+import { flaggedClock } from "../lib/metrics/stage";
 
 const AS_OF = "2026-10-15T18:00:00.000Z";
 
@@ -31,6 +32,13 @@ describe("demo portfolio", () => {
     expect(byId.org_peakline.stageTiming.businessDaysInStage).toBe(6);
     expect(byId.org_horizon.stageTiming.inStageTone).toBe("green");
     expect(byId.org_horizon.stageTiming.onboardingToLaunched.tone).toBe("red");
+    expect(byId.org_horizon.stageTiming.onboardingToLaunched.businessDays).toBe(8);
+    expect(flaggedClock(byId.org_horizon.stageTiming)).toEqual({ tone: "red", businessDays: 8 });
+    expect(flaggedClock(byId.org_peakline.stageTiming)).toEqual({ tone: "red", businessDays: 6 });
+    expect(flaggedClock(byId.org_copperline.stageTiming)).toEqual({
+      tone: "red",
+      businessDays: byId.org_copperline.stageTiming.businessDaysInStage,
+    });
     expect(byId.org_copperline.stageTiming.inStageTone).toBe("red");
     expect(byId.org_northwind.cxm).toBeNull();
     expect(byId.org_northwind.legacySeamlessDealer).toBe(true);
