@@ -106,13 +106,18 @@ Unit tests cover the pace curve, status bands, the quiet-account rule, window cl
 
 Pages and the agents hub read Postgres. A backfill pulls every superadmin list. A daily cron pulls what changed. Nothing in a page render calls SubcontractorHub.
 
-1. Open the Vercel project → **Storage** → **Create** → **Neon** (Marketplace) and connect it to this project. That sets `DATABASE_URL` and `POSTGRES_URL` on Production, Preview, and Development. Do not paste the URL into chat or commit it.
-2. In **Project Settings → Environment Variables**, set `SUBHUB_API_BASE_URL` to `https://api.virtualsaleportal.com`. Set `SUBHUB_API_USERNAME` and `SUBHUB_API_PASSWORD` for the Executive Leadership Read Only user. Leave `SUBHUB_AUTH_MODE` as `auto` and `SUBHUB_LOGIN_PATH` blank.
-3. Set `DASHBOARD_PASSWORD` so `/sync` is not public. Set `CRON_SECRET` to a long random string. Vercel Cron sends it as `Authorization: Bearer <CRON_SECRET>`.
-4. Pull the env locally (`vercel env pull .env.local`) or copy `DATABASE_URL` into `.env.local`. From the repo root run `npm run db:migrate`. That applies `db/migrations/0001_sync.sql` (orgs, org_subscriptions, projects, financials, esign_status, commissions, sync_runs, sync_cursors, account_snapshots).
-5. Deploy. The crons in `vercel.json` are registered on production: `/api/cron/sync` at 09:00 UTC (2:00 AM Pacific during daylight time, 1:00 AM during standard time) and `/api/cron/orgs` hourly.
-6. Sign in and open `/sync`. Click **Run backfill now**. Each click stores a few pages and resumes from the cursor. Repeat until the cursors say Complete, or wait for the cron, which re-invokes itself until the pass is done or 80 hops.
-7. Open `/`. The banner says **Stored copy** and the line under it says **Data as of** the last successful sync. `/api/health` returns `status: "ready"` and `dataAsOf` once orgs are stored. It does not include the token.
+The deployed app applies `db/migrations/0001_sync.sql` itself. You do not run `npm run db:migrate` on a laptop. The statements are idempotent (`CREATE TABLE IF NOT EXISTS`). The setup and the first sync each take a Postgres transaction advisory lock (`pg_advisory_xact_lock`) so two callers cannot create the tables at the same time. A finished run records `0001_sync` in `schema_migrations`.
+
+`SUBHUB_API_BASE_URL` is `https://api.virtualsaleportal.com`. `SUBHUB_API_USERNAME` and `SUBHUB_API_PASSWORD` are the Executive Leadership Read Only user. Leave `SUBHUB_AUTH_MODE` as `auto`. Set `DASHBOARD_PASSWORD` so `/sync` is not public.
+
+1. Connect Neon from the Vercel project’s **Storage** tab. That sets `DATABASE_URL`. Do not paste the URL into chat or commit it.
+2. Add `CRON_SECRET` (a long random string). Vercel Cron sends it as `Authorization: Bearer <CRON_SECRET>`.
+3. Redeploy.
+4. Open `/sync`. The status line shows whether the database is connected, whether migrations have been applied, and whether `CRON_SECRET` is set. Those are booleans. The page never shows the secret.
+5. Click **Set up database**.
+6. Click **Run backfill now**. Each click stores a few pages and resumes from the cursor. Repeat until the cursors say Complete, or wait for the cron, which re-invokes itself until the pass is done or 80 hops. The first sync also applies the migration if the button was skipped.
+
+The crons in `vercel.json` are registered on production: `/api/cron/sync` at 09:00 UTC (2:00 AM Pacific during daylight time, 1:00 AM during standard time) and `/api/cron/orgs` hourly. Open `/` after the backfill. The banner says **Stored copy** and the line under it says **Data as of** the last successful sync. `/api/health` returns `status: "ready"` and `dataAsOf` once orgs are stored. It does not include the token.
 
 The daily job uses `updated_since` when the API accepts it. It does not today. See engineering request P0-5a. Until Ashish adds that filter, the job probes `updated_since`, `updated_after`, `from`, and `updated_at_from`, then `sort=-updated_at` and `sort=-created_at`. A 422 is recorded on the cursor and that param is not sent again. If none of those work, the daily pass waits and Sunday runs a full reconcile. Upserts are by id. A failed refresh leaves the last rows in place.
 

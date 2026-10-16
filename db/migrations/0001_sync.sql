@@ -1,6 +1,11 @@
 -- Stored copy of the SubcontractorHub superadmin lists.
--- Apply with: npm run db:migrate
+-- The app applies this file from /sync and from the first sync run.
 -- Safe to re-run.
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id text PRIMARY KEY,
+  applied_at timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS orgs (
   id text PRIMARY KEY,
@@ -144,3 +149,5 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS account_snapshots_day_idx ON account_snapshots (day);
+
+INSERT INTO schema_migrations (id) VALUES ('0001_sync') ON CONFLICT (id) DO NOTHING;

@@ -14,6 +14,8 @@ import {
   shouldFullReconcile,
   splitAtHighWater,
 } from "./high-water";
+import { ensureMigrations } from "../db/migrate";
+import { databaseUrl } from "../db/sql";
 import { normalizeFor, normalizeOrg, orgIdOf, subscriptionsForOrg, type GenericRow, type OrgRow, type ProjectRow } from "./rows";
 import { getStore } from "./store";
 import { emptyCursor, type CursorState, type SyncStore } from "./types";
@@ -61,6 +63,19 @@ export async function runSync(options: SyncOptions = {}): Promise<SyncReport> {
 }
 
 async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
+  if (databaseUrl()) {
+    const ready = await ensureMigrations();
+    if (!ready.applied) {
+      return {
+        pending: false,
+        rows: 0,
+        pages: 0,
+        endpoint: null,
+        status: "error",
+        error: "Database migrations are not applied.",
+      };
+    }
+  }
   const store = getStore();
   const requested = options.endpoints ?? (options.kind === "orgs" ? (["orgs"] as EndpointId[]) : ENDPOINTS.map((endpoint) => endpoint.id));
   const now = options.now ?? new Date();

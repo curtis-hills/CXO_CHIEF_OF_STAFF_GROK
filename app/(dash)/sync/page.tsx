@@ -1,8 +1,10 @@
 import { PageHeader } from "@/components/ui";
+import { readSetupStatus } from "@/lib/db/migrate";
 import { formatUtcTimestamp } from "@/lib/metrics/calendar";
 import { ENDPOINTS } from "@/lib/sync/catalog";
-import { databaseConfigured, getStore } from "@/lib/sync/store";
-import { runBackfillNow } from "./actions";
+import { getStore } from "@/lib/sync/store";
+import type { CursorState, SyncRunRow, SyncStore } from "@/lib/sync/types";
+import { runBackfillNow, setupDatabase } from "./actions";
 
 export const metadata = { title: "Sync" };
 
@@ -13,12 +15,14 @@ export default async function SyncPage({
 }) {
   const query = await searchParams;
   const result = Array.isArray(query.result) ? query.result[0] : query.result;
-  const configured = databaseConfigured();
-  const store = configured ? getStore() : null;
-  const runs = store ? await store.listRuns(40) : [];
-  const cursors = store
-    ? await Promise.all(ENDPOINTS.map(async (endpoint) => ({ id: endpoint.id, state: await store.getCursor(endpoint.id) })))
-    : [];
+  const setup = await readSetupStatus();
+  let runs: SyncRunRow[] = [];
+  let cursors: { id: string; state: CursorState | null }[] = [];
+  if (setup.databaseConnected && setup.migrationsApplied) {
+    const store: SyncStore = getStore();
+    runs = await store.listRuns(40);
+    cursors = await Promise.all(ENDPOINTS.map(async (endpoint) => ({ id: endpoint.id, state: await store.getCursor(endpoint.id) })));
+  }
 
   return (
     <>
@@ -27,22 +31,37 @@ export default async function SyncPage({
         title="Stored copy of SubcontractorHub"
         lede="Pages read this database. They do not call SubcontractorHub while rendering. The backfill walks every list at 50 rows a page and resumes from the saved cursor. The daily job runs at 09:00 UTC, about 2:00 AM Pacific during daylight time. An hourly job refreshes organizations only."
       />
+      <p className="mb-4 text-sm">
+        Database connected: {String(setup.databaseConnected)}. Migrations applied: {String(setup.migrationsApplied)}. CRON_SECRET set:{" "}
+        {String(setup.cronSecretSet)}.
+      </p>
+      {result === "ready" ? <p className="mb-4 text-sm">Database is ready.</p> : null}
+      {result === "setup-error" ? (
+        <p className="mb-4 text-sm">Database setup did not finish. Check the function logs, then try Set up database again.</p>
+      ) : null}
       {result === "done" ? <p className="mb-4 text-sm">Backfill chunk finished.</p> : null}
       {result === "pending" ? (
         <p className="mb-4 text-sm">Backfill is still in progress. Run it again to continue from the saved cursor.</p>
       ) : null}
       {result === "error" ? <p className="mb-4 text-sm">The last chunk stopped on an error. The table below has the message.</p> : null}
-      {result === "unconfigured" ? <p className="mb-4 text-sm">Connect the database before running a backfill.</p> : null}
-      {!configured ? (
+      {result === "unconfigured" ? <p className="mb-4 text-sm">Connect Neon from the Vercel Storage tab, then redeploy.</p> : null}
+      {!setup.databaseConnected ? (
         <p className="mb-4 rounded-lg border border-line bg-card px-4 py-3 text-sm">
-          DATABASE_URL is not set. Connect Neon from the Vercel Storage tab, then run the migration.
+          The database is not connected. Connect Neon from the Vercel Storage tab and redeploy.
         </p>
       ) : null}
-      <form action={runBackfillNow} className="mb-6">
-        <button type="submit" className="rounded-md bg-navy px-3 py-2 text-sm text-white" disabled={!configured}>
-          Run backfill now
-        </button>
-      </form>
+      <div className="mb-6 flex flex-wrap gap-3">
+        <form action={setupDatabase}>
+          <button type="submit" className="rounded-md border border-line bg-card px-3 py-2 text-sm" disabled={!setup.databaseConnected}>
+            Set up database
+          </button>
+        </form>
+        <form action={runBackfillNow}>
+          <button type="submit" className="rounded-md bg-navy px-3 py-2 text-sm text-white" disabled={!setup.databaseConnected}>
+            Run backfill now
+          </button>
+        </form>
+      </div>
       <h2 className="mb-2 font-serif text-2xl">Cursors</h2>
       <div className="mb-8 overflow-x-auto rounded-lg border border-line bg-card">
         <table className="data">

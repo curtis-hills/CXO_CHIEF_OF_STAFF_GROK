@@ -3,7 +3,7 @@ import { neon } from "@neondatabase/serverless";
 
 const url = process.env.DATABASE_URL?.trim() || process.env.POSTGRES_URL?.trim();
 if (!url) {
-  console.error("Set DATABASE_URL or POSTGRES_URL, then run npm run db:migrate.");
+  console.error("DATABASE_URL is not set. The deployed app applies migrations from /sync. This script is optional.");
   process.exit(1);
 }
 
@@ -20,7 +20,8 @@ const statements = source
   .filter((statement) => statement.length > 0);
 
 const sql = neon(url);
-for (const statement of statements) {
-  await sql.query(statement);
-}
+await sql.transaction((txn) => [
+  txn.query("SELECT pg_advisory_xact_lock(872431, 1)"),
+  ...statements.map((statement) => txn.query(statement)),
+]);
 console.log(`Applied ${statements.length} statements.`);
