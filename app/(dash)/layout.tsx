@@ -9,6 +9,7 @@ export default async function DashLayout({ children }: { children: React.ReactNo
   return (
     <Shell
       mode={portfolio.mode}
+      notice={portfolio.notice}
       alertCount={portfolio.alerts.length}
       authRequired={Boolean(process.env.DASHBOARD_PASSWORD)}
       asOf={portfolio.asOf}

@@ -5,12 +5,14 @@ import { SideNav } from "./side-nav";
 export function Shell({
   children,
   mode,
+  notice,
   alertCount,
   authRequired,
   asOf,
 }: {
   children: ReactNode;
   mode: "mock" | "live";
+  notice: string | null;
   alertCount: number;
   authRequired: boolean;
   asOf: string;
@@ -32,7 +34,12 @@ export function Shell({
       </aside>
       <div className="min-w-0">
         <div className="border-b border-line bg-[#efe8db] px-5 py-2 text-sm text-ink lg:px-8">
-          {mode === "mock" ? (
+          {notice ? (
+            <p>
+              <span className="font-semibold">Demo data.</span> The live API could not be read, so this is a labeled stand-in.{" "}
+              <span className="break-words">{notice}</span>
+            </p>
+          ) : mode === "mock" ? (
             <p>
               <span className="font-semibold">Demo data.</span> API credentials are not set, so this is a labeled stand-in
               portfolio. Lifecycle dates are proxies until engineering ships them.

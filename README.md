@@ -58,9 +58,11 @@ Set these in `.env.local` and in the Vercel project. Do not prefix them with `NE
 
 Sanctum login is optional. It runs only when `SUBHUB_AUTH_MODE=login`, or when mode is `auto`, `SUBHUB_LOGIN_PATH` is set, and the earlier mode returns 401. The token is cached in memory. A 401 refreshes it once and retries once. Explicit `login` with a blank path uses `/api/login`.
 
-`GET /api/health` reports `demo`, `connected`, or `auth failed`, and the mode that succeeded. It does not return credentials, tokens, or response bodies. HTTP 200 is demo or connected. HTTP 401 is a rejected login. HTTP 503 means the API could not be reached. The route stays available when the dashboard password is set so a deploy check can call it. The body is still only status and mode.
+`GET /api/health` reports `demo`, `connected`, `auth failed`, or `unexpected body`, plus the auth mode that was tried. When the API answers, the JSON also includes `upstreamStatus`, `contentType`, `bodyKind`, `topLevelKeys`, `recordCount`, and a short `detail`. HTML is described by its title and markers such as `form` or `password-field`. JSON detail lists keys, not record values. The route does not return credentials, tokens, or response bodies. HTTP 200 is demo, connected, or an unexpected body you can paste back. HTTP 401 is a rejected login. HTTP 503 means the API could not be reached. The route stays available when the dashboard password is set.
 
-Credentials are read only in server modules (`lib/api/client.ts` imports `server-only`). They are not sent to the browser. Errors report the status code and the path, and any echoed secret is redacted.
+The list parser accepts a top-level array, `data`, `orgs`, `results`, `projects`, a nested `results.data` cursor page, and a Laravel paginator (`data`, `links`, `meta`, `next_cursor`, or `page`). If the body is HTML, unrecognized JSON, or any other API error, every page stays up on labeled demo data and the banner quotes the sanitized error.
+
+Credentials are read only in server modules (`lib/api/client.ts` imports `server-only`). They are not sent to the browser. Errors include the status code, content type, body kind, top-level keys, and a short sanitized snippet. Secrets and email addresses are redacted.
 
 ## Demo data and missing fields
 
@@ -99,7 +101,7 @@ Health v1 scores volume (75) and billing (25). Through day 60, volume follows pa
 npm test
 ```
 
-Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, and API auth (Basic, bearer, basic-plus-key, token cache, and one re-login).
+Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, API auth, response-shape parsing, sanitized API errors, and the demo fallback when the API body cannot be used.
 
 ## Deploy on Vercel
 

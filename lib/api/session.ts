@@ -4,6 +4,10 @@
  * values that are safe to send to a browser.
  */
 
+import { inspectResponse, redactSecrets } from "./body";
+
+export { redactSecrets };
+
 export const DEFAULT_BASE_URL = "https://app.subcontractorhub.com";
 export const DEFAULT_KEY_HEADER = "X-API-Key";
 export const DEFAULT_LOGIN_PATH = "/api/login";
@@ -27,9 +31,15 @@ export type ApiAuthConfig = {
 };
 
 export type ConnectionReport = {
-  status: "demo" | "connected" | "auth failed";
+  status: "demo" | "connected" | "auth failed" | "unexpected body";
   mode?: AuthModeName;
   httpStatus: number;
+  upstreamStatus?: number;
+  contentType?: string;
+  bodyKind?: "html" | "json" | "text" | "empty";
+  topLevelKeys?: string[];
+  recordCount?: number | null;
+  detail?: string;
 };
 
 export class AuthRejectedError extends Error {
@@ -145,14 +155,6 @@ export function basicAuthorization(username: string, password: string): string {
   return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
 }
 
-export function redactSecrets(message: string, secrets: Array<string | undefined>): string {
-  let out = message;
-  const unique = [...new Set(secrets.filter((secret): secret is string => Boolean(secret && secret.length >= 3)))];
-  unique.sort((a, b) => b.length - a.length);
-  for (const secret of unique) out = out.split(secret).join("[redacted]");
-  return out;
-}
-
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export class ApiSession {
@@ -178,10 +180,21 @@ export class ApiSession {
     if (intent === "incomplete") return { status: "auth failed", httpStatus: 401 };
     try {
       const { response, mode } = await this.request("/api/v1/superadmin/orgs", { limit: 1 });
-      await discard(response);
-      if (response.ok) return { status: "connected", mode, httpStatus: 200 };
-      if (response.status === 401 || response.status === 403) return { status: "auth failed", httpStatus: 401 };
-      return { status: "auth failed", httpStatus: 503 };
+      const text = await response.text();
+      const { summary } = inspectResponse(response.headers.get("content-type"), text, [this.config.apiKey, this.config.password]);
+      const diagnostic = {
+        mode,
+        upstreamStatus: response.status,
+        contentType: summary.contentType,
+        bodyKind: summary.bodyKind,
+        topLevelKeys: summary.topLevelKeys,
+        recordCount: summary.recordCount,
+        detail: summary.detail,
+      };
+      if (response.status === 401 || response.status === 403) return { status: "auth failed", httpStatus: 401, ...diagnostic };
+      if (!response.ok) return { status: "auth failed", httpStatus: 503, ...diagnostic };
+      if (summary.bodyKind === "json" && summary.recordCount !== null) return { status: "connected", httpStatus: 200, ...diagnostic };
+      return { status: "unexpected body", httpStatus: 200, ...diagnostic };
     } catch (error) {
       if (error instanceof AuthRejectedError) return { status: "auth failed", httpStatus: 401 };
       if (error instanceof Error && /credentials are not valid|AUTH_MODE|KEY_HEADER/.test(error.message)) throw error;
