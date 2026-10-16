@@ -1,51 +1,78 @@
 import "server-only";
 
+import {
+  ApiSession,
+  AuthRejectedError,
+  connectionIntent,
+  readApiAuthConfig,
+  type AuthModeName,
+  type ConnectionReport,
+} from "./session";
 import type { ApiOrg, ApiProject, CursorPage } from "./types";
-
-const DEFAULT_BASE = "https://api.virtualsaleportal.com";
-
-export function getApiConfig(): { apiKey: string; baseUrl: string; live: boolean } {
-  const apiKey = process.env.SUBHUB_API_KEY?.trim() ?? "";
-  const configured = process.env.SUBHUB_API_BASE_URL?.trim() || DEFAULT_BASE;
-  const baseUrl = configured.replace(/\/$/, "");
-  return { apiKey, baseUrl, live: apiKey.length > 0 };
-}
 
 export class SubhubApiError extends Error {
   readonly status: number;
   readonly path: string;
 
   constructor(status: number, path: string) {
-    super(`SubcontractorHub API returned ${status} for ${path}`);
+    super(`SubcontractorHub API ${path} returned ${status}`);
     this.name = "SubhubApiError";
     this.status = status;
     this.path = path;
   }
 }
 
-export async function shGet<T>(path: string, params: Record<string, string | number | undefined> = {}): Promise<T> {
-  const { apiKey, baseUrl, live } = getApiConfig();
-  if (!live) {
-    throw new Error("SUBHUB_API_KEY is not set");
+let session: ApiSession | null = null;
+let sessionFingerprint = "";
+
+function currentSession(): ApiSession {
+  const config = readApiAuthConfig(process.env);
+  const fingerprint = [
+    config.baseUrl,
+    config.mode,
+    config.keyHeader,
+    config.loginPath,
+    config.loginUsernameField,
+    config.loginPasswordField,
+    config.loginKeyField,
+    config.loginDeviceName,
+    config.apiKey,
+    config.username,
+    config.password,
+  ].join("\u0000");
+  if (!session || sessionFingerprint !== fingerprint) {
+    session = new ApiSession(config, fetch);
+    sessionFingerprint = fingerprint;
   }
+  return session;
+}
 
-  const url = new URL(path.startsWith("/") ? path : `/${path}`, baseUrl);
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== "") url.searchParams.set(key, String(value));
+export function getApiConfig(): { baseUrl: string; live: boolean; mode: AuthModeName | "auto" | "demo" } {
+  const config = readApiAuthConfig(process.env);
+  const intent = connectionIntent(config);
+  return {
+    baseUrl: config.baseUrl,
+    live: intent === "ready",
+    mode: intent === "ready" ? config.mode : "demo",
+  };
+}
+
+export async function checkApiConnection(): Promise<ConnectionReport> {
+  return currentSession().probe();
+}
+
+async function shGet<T>(path: string, search?: Record<string, string | number | undefined>): Promise<T> {
+  let response: Response;
+  try {
+    ({ response } = await currentSession().request(path, search));
+  } catch (error) {
+    if (error instanceof AuthRejectedError) throw new SubhubApiError(401, path);
+    throw error;
   }
-
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      Accept: "application/json",
-    },
-    cache: "no-store",
-  });
-
-  if (!response.ok) {
+  if (!response.ok || (response.status >= 300 && response.status < 400)) {
+    await response.arrayBuffer().catch(() => undefined);
     throw new SubhubApiError(response.status, path);
   }
-
   try {
     return (await response.json()) as T;
   } catch {
@@ -76,7 +103,7 @@ async function mapPool<T, R>(items: T[], limit: number, fn: (item: T, index: num
     while (next < items.length) {
       const index = next;
       next += 1;
-      results[index] = await fn(items[index], index);
+      results[index] = await fn(items[index]!, index);
     }
   }
   const workers = Math.min(limit, items.length);

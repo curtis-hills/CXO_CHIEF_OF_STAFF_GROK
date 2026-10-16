@@ -29,19 +29,38 @@ npm test
 npm run dev
 ```
 
-Open http://localhost:3000. With no API key, every page renders labeled demo data.
+Open http://localhost:3000. With no API credentials, every page renders labeled demo data.
 
 ## Environment variables
 
-Set these in `.env.local` and in the Vercel project. Do not prefix them with `NEXT_PUBLIC_`. Do not commit a real key.
+Set these in `.env.local` and in the Vercel project. Do not prefix them with `NEXT_PUBLIC_`. Do not commit a real key or password.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `SUBHUB_API_KEY` | No | Bearer token for the read-only Executive API. When it is empty, the app uses demo data. |
-| `SUBHUB_API_BASE_URL` | No | Defaults to `https://api.virtualsaleportal.com`. |
+| `SUBHUB_API_BASE_URL` | No | Defaults to `https://app.subcontractorhub.com`. |
+| `SUBHUB_AUTH_MODE` | No | `auto` (default), `bearer`, `basic`, `basic+key`, or `login`. |
+| `SUBHUB_API_KEY` | No | Bearer token, or the key sent beside Basic auth. |
+| `SUBHUB_API_USERNAME` | No | Service-user username for Basic auth or Sanctum login. |
+| `SUBHUB_API_PASSWORD` | No | Service-user password. |
+| `SUBHUB_API_KEY_HEADER` | No | Header for the key in `basic+key`. Defaults to `X-API-Key`. |
+| `SUBHUB_LOGIN_PATH` | No | Optional Sanctum login path. Blank disables that fallback. |
+| `SUBHUB_LOGIN_USERNAME_FIELD` | No | JSON field for the username. Defaults to `email`. |
+| `SUBHUB_LOGIN_PASSWORD_FIELD` | No | JSON field for the password. Defaults to `password`. |
+| `SUBHUB_LOGIN_KEY_FIELD` | No | JSON field for the key on login. Defaults to `key`. Blank omits it. |
+| `SUBHUB_LOGIN_DEVICE_NAME` | No | Sanctum `device_name`. Defaults to `cxm-dashboard`. |
 | `DASHBOARD_PASSWORD` | No | Turns on the placeholder password gate. When it is empty, the app is open and says so. |
 
-The key is read only in server modules (`lib/api/client.ts` imports `server-only`). It is not sent to the browser and it is not written to logs. API errors report the status code and the path only.
+`auto` picks the first mode it can fill, in this order:
+
+1. `basic+key` when username, password, and key are all set. This matches the browser prompt on the API URL plus the service key. The password is `Authorization: Basic`, and the key goes in `SUBHUB_API_KEY_HEADER` because one Authorization header cannot hold both.
+2. `basic` when username and password are set.
+3. `bearer` when only the key is set (`Authorization: Bearer`).
+
+Sanctum login is optional. It runs only when `SUBHUB_AUTH_MODE=login`, or when mode is `auto`, `SUBHUB_LOGIN_PATH` is set, and the earlier mode returns 401. The token is cached in memory. A 401 refreshes it once and retries once. Explicit `login` with a blank path uses `/api/login`.
+
+`GET /api/health` reports `demo`, `connected`, or `auth failed`, and the mode that succeeded. It does not return credentials, tokens, or response bodies. HTTP 200 is demo or connected. HTTP 401 is a rejected login. HTTP 503 means the API could not be reached. The route stays available when the dashboard password is set so a deploy check can call it. The body is still only status and mode.
+
+Credentials are read only in server modules (`lib/api/client.ts` imports `server-only`). They are not sent to the browser. Errors report the status code and the path, and any echoed secret is redacted.
 
 ## Demo data and missing fields
 
@@ -80,15 +99,16 @@ Health v1 scores volume (75) and billing (25). Through day 60, volume follows pa
 npm test
 ```
 
-Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), and the health score.
+Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, and API auth (Basic, bearer, basic-plus-key, token cache, and one re-login).
 
 ## Deploy on Vercel
 
 1. Import this repository. Framework preset is Next.js. Do not set a custom build command.
-2. In Project Settings → Environment Variables, add `SUBHUB_API_BASE_URL` if you need to override it.
-3. Add `SUBHUB_API_KEY` only on the environments that should call the API. Leave it unset on Preview if you want those deployments to stay on demo data. Put the key in the Vercel UI. Do not paste it into chat or commit it.
-4. Set `DASHBOARD_PASSWORD` on any deployment other people can open. This is a placeholder until Google SSO and a role list (admin, CX leader, support, CXM).
-5. Deploy. `npm run build` is the production build.
+2. In Project Settings → Environment Variables, set `SUBHUB_API_BASE_URL` to `https://app.subcontractorhub.com` (that is also the default).
+3. For a live environment, set `SUBHUB_API_USERNAME`, `SUBHUB_API_PASSWORD`, and `SUBHUB_API_KEY`. Leave `SUBHUB_AUTH_MODE` as `auto` so the app sends Basic auth plus the key header. Leave all three unset on Preview if that deployment should stay on demo data. Put secrets in the Vercel UI. Do not paste them into chat or commit them.
+4. Set `SUBHUB_LOGIN_PATH` only if the Basic prompt is not the real gate and a Sanctum login request is required.
+5. Set `DASHBOARD_PASSWORD` on any deployment other people can open. This is a placeholder until Google SSO and a role list (admin, CX leader, support, CXM).
+6. Deploy. `npm run build` is the production build. Open `/api/health` and expect `{"status":"connected","mode":"basic+key"}` when the service user is set.
 
 There is no cron sync and no database in this phase. Each request reads the API, or demo data, and applies any manual dates saved on that instance.
 

@@ -34,7 +34,7 @@ export function Shell({
         <div className="border-b border-line bg-[#efe8db] px-5 py-2 text-sm text-ink lg:px-8">
           {mode === "mock" ? (
             <p>
-              <span className="font-semibold">Demo data.</span> SUBHUB_API_KEY is not set, so this is a labeled stand-in
+              <span className="font-semibold">Demo data.</span> API credentials are not set, so this is a labeled stand-in
               portfolio. Lifecycle dates are proxies until engineering ships them.
             </p>
           ) : (
