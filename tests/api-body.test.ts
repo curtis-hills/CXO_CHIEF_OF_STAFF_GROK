@@ -8,12 +8,12 @@ import {
 import { MAX_PAGES, PAGE_SIZE } from "../lib/api/limits";
 import { healthPayload } from "../lib/api/health-payload";
 import { MAX_RATE_LIMIT_RETRIES, retryDelayMs } from "../lib/api/rate-limit";
-import { PORTFOLIO_TTL_MS } from "../lib/api/limits";
 import { fetchOrgs, resetApiSession } from "../lib/api/client";
 import { ApiSession, type ApiAuthConfig } from "../lib/api/session";
-import { ageLiveInputsCache } from "../lib/data/live-cache";
 import { assemblePortfolio } from "../lib/data/assemble";
 import { readPortfolio } from "../lib/data/load";
+import { resetSyncInflight, runSync } from "../lib/sync/runner";
+import { resetMemoryStore } from "../lib/sync/store";
 
 const PASSWORD = "super-secret-password";
 const API_KEY = "svc-key-9f3c";
@@ -328,6 +328,8 @@ describe("page fallback", () => {
     restore("SUBHUB_AUTH_MODE", previous.mode);
     restore("SUBHUB_API_BASE_URL", previous.base);
     resetApiSession();
+    resetMemoryStore();
+    resetSyncInflight();
   });
 
   it("keeps every page on labeled demo data when the API returns HTML", async () => {
@@ -344,11 +346,15 @@ describe("page fallback", () => {
         { status: 200, headers: { "content-type": "text/html" } },
       );
     try {
+      const report = await runSync({ kind: "backfill", endpoints: ["orgs"], maxPages: 2 });
+      expect(report.status).toBe("error");
+      expect(report.error).toContain("text/html");
+      expect(report.error).toContain('title "Login [redacted]"');
+      expect(report.error).not.toContain(PASSWORD);
+      expect(report.error).not.toContain(EMAIL);
       const portfolio = await readPortfolio();
       expect(portfolio.mode).toBe("mock");
       expect(portfolio.accounts.length).toBeGreaterThan(0);
-      expect(portfolio.notice).toContain("text/html");
-      expect(portfolio.notice).toContain('title "Login [redacted]"');
       expect(portfolio.notice).not.toContain(PASSWORD);
       expect(portfolio.notice).not.toContain(EMAIL);
     } finally {
@@ -363,8 +369,10 @@ describe("page fallback", () => {
     process.env.SUBHUB_AUTH_MODE = "basic";
     process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
     resetApiSession();
+    let calls = 0;
     const original = globalThis.fetch;
     globalThis.fetch = async (input) => {
+      calls += 1;
       const url = String(input);
       if (url.includes("/orgs")) {
         return Response.json({ data: [{ id: "org_live", name: "Live Roofing", status: "launched" }] });
@@ -372,7 +380,10 @@ describe("page fallback", () => {
       return Response.json({ projects: [] });
     };
     try {
+      await runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 4 });
+      const afterSync = calls;
       const portfolio = await readPortfolio();
+      expect(calls).toBe(afterSync);
       expect(portfolio.mode).toBe("live");
       expect(portfolio.notice).toBeNull();
       expect(portfolio.accounts.map((account) => account.name)).toContain("Live Roofing");
@@ -404,6 +415,8 @@ describe("page fallback", () => {
       });
     };
     try {
+      await runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 4 });
+      const afterSync = urls.length;
       const first = await readPortfolio();
       const second = await readPortfolio();
       expect(first.mode).toBe("live");
@@ -411,6 +424,7 @@ describe("page fallback", () => {
       expect(urls.filter((url) => url.includes("/orgs"))).toHaveLength(1);
       expect(urls.filter((url) => url.includes("/projects"))).toHaveLength(1);
       expect(urls.some((url) => url.includes("org_id="))).toBe(false);
+      expect(urls).toHaveLength(afterSync);
     } finally {
       globalThis.fetch = original;
     }
@@ -437,7 +451,7 @@ describe("page fallback", () => {
       return Response.json({ results: { data: [] } });
     };
     try {
-      const portfolio = await readPortfolio();
+      const portfolio = await runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 6 }).then(() => readPortfolio());
       expect(portfolio.mode).toBe("live");
       expect(urls.some((url) => url.includes("/projects") && !url.includes("org_id="))).toBe(true);
       expect(urls.some((url) => url.includes("org_id=org_live"))).toBe(true);
@@ -477,7 +491,7 @@ describe("page fallback", () => {
       return Response.json({ results: { data: [{ id: `p-${orgId}`, org_id: orgId }] } });
     };
     try {
-      const portfolio = await readPortfolio();
+      const portfolio = await runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 8 }).then(() => readPortfolio());
       expect(maxInFlight).toBe(1);
       expect(portfolio.mode).toBe("live");
       expect(portfolio.accounts.map((account) => account.name).sort()).toEqual(["Alpha Roofing", "Beta Roofing"]);
@@ -522,7 +536,7 @@ describe("page fallback", () => {
       return Response.json({ results: { data: [{ id: "p1", org_id: "org_live" }] } });
     };
     try {
-      const recovered = await readPortfolio();
+      const recovered = await runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 6 }).then(() => readPortfolio());
       expect(logins).toBe(1);
       expect(projectAttempts).toBe(2);
       expect(recovered.mode).toBe("live");
@@ -531,6 +545,8 @@ describe("page fallback", () => {
       expect(recovered.notice).toBeNull();
 
       resetApiSession();
+      resetMemoryStore();
+      resetSyncInflight();
       logins = 0;
       projectAttempts = 0;
       globalThis.fetch = async (input, init) => {
@@ -553,7 +569,7 @@ describe("page fallback", () => {
           },
         });
       };
-      const partial = await readPortfolio();
+      const partial = await runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 6 }).then(() => readPortfolio());
       expect(logins).toBe(1);
       expect(projectAttempts).toBe(MAX_RATE_LIMIT_RETRIES + 1);
       expect(partial.mode).toBe("live");
@@ -604,20 +620,25 @@ describe("page fallback", () => {
       return Response.json({ results: { data: [{ id: "p1", org_id: "org_live" }] } });
     };
     try {
-      const [first, second] = await Promise.all([readPortfolio(), readPortfolio()]);
+      const [firstRun, secondRun] = await Promise.all([
+        runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 6 }),
+        runSync({ kind: "backfill", endpoints: ["orgs", "projects"], maxPages: 6 }),
+      ]);
+      expect(firstRun.rows).toBe(secondRun.rows);
+      const first = await readPortfolio();
+      const second = await readPortfolio();
       expect(first.mode).toBe("live");
       expect(second.accounts.map((account) => account.id)).toEqual(first.accounts.map((account) => account.id));
       expect(orgCalls).toBe(1);
       expect(logins).toBe(1);
       const dataAsOf = first.dataAsOf;
-      ageLiveInputsCache(PORTFOLIO_TTL_MS + 1_000);
       fail = true;
+      await runSync({ kind: "incremental", endpoints: ["orgs", "projects"], maxPages: 2 });
       const stale = await readPortfolio();
       expect(stale.mode).toBe("live");
       expect(stale.accounts.map((account) => account.name)).toEqual(["Live Roofing"]);
       expect(stale.dataAsOf).toBe(dataAsOf);
-      expect(stale.notice).toContain("last snapshot");
-      expect(stale.notice).not.toContain("cached-token-snap");
+      expect(stale.notice ?? "").not.toContain("cached-token-snap");
       expect(stale.accounts.some((account) => account.name === "Horizon Sales Partners")).toBe(false);
       const held = await readPortfolio();
       expect(held.dataAsOf).toBe(dataAsOf);

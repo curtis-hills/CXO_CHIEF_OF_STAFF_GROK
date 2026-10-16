@@ -6,7 +6,14 @@ export async function middleware(request: NextRequest) {
   if (!password) return NextResponse.next();
 
   const { pathname } = request.nextUrl;
-  if (pathname === "/login" || pathname === "/api/health" || pathname.startsWith("/api/auth")) return NextResponse.next();
+  if (
+    pathname === "/login" ||
+    pathname === "/api/health" ||
+    pathname.startsWith("/api/auth") ||
+    pathname.startsWith("/api/cron")
+  ) {
+    return NextResponse.next();
+  }
 
   const cookie = request.cookies.get("cxm_session")?.value ?? "";
   const expected = await sessionToken(password);

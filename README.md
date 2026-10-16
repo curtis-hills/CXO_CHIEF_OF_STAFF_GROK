@@ -15,7 +15,8 @@ A transaction is a new project created. That is the signed customer, billed at $
 | `/health` | v1 health score from volume trend and billing |
 | `/actions` | Alerts derived from those signals |
 | `/agents` | One card per planned agent. None of them run yet |
-| `/engineering` | Draft engineering request list |
+| `/engineering` | Draft engineering request list, including the `updated_since` ask |
+| `/sync` | Sync history and a backfill button. Behind the dashboard password |
 | `/login` | Password placeholder until company SSO |
 
 Setup is CX Admin’s work (later, the CXM Admin agent). The CXM runs kickoff and training and sets Launched. Amanda Hatch’s chat support is first contact after launch. Craig Kersey, Director of CX, is the escalation.
@@ -29,7 +30,7 @@ npm test
 npm run dev
 ```
 
-Open http://localhost:3000. With no API credentials, every page renders labeled demo data.
+Open http://localhost:3000. With no `DATABASE_URL`, every page renders labeled demo data.
 
 ## Environment variables
 
@@ -48,15 +49,17 @@ Set these in `.env.local` and in the Vercel project. Do not prefix them with `NE
 | `SUBHUB_LOGIN_PASSWORD_FIELD` | No | JSON field for the password. Defaults to `password`. |
 | `SUBHUB_LOGIN_KEY_FIELD` | No | Optional JSON field for a key. Blank omits it. |
 | `SUBHUB_LOGIN_DEVICE_NAME` | No | Optional Sanctum `device_name`. Blank omits it. |
-| `DASHBOARD_PASSWORD` | No | Turns on the placeholder password gate. When it is empty, the app is open and says so. |
+| `DASHBOARD_PASSWORD` | No | Turns on the placeholder password gate. When it is empty, the app is open and says so. `/sync` is behind this gate. |
+| `DATABASE_URL` | For a stored copy | Neon pooled URL. `POSTGRES_URL` is accepted as the same value. The Vercel Neon integration sets both. |
+| `CRON_SECRET` | For scheduled sync | Vercel sends `Authorization: Bearer <CRON_SECRET>` to the cron routes. |
 
 `auto` uses Laravel Sanctum when `SUBHUB_API_USERNAME` and `SUBHUB_API_PASSWORD` are set. HTTP Basic is not used in auto mode: the API answers it with the HTML login page. A key alone still uses `Authorization: Bearer`. Set `SUBHUB_AUTH_MODE` to `basic` or `basic+key` only to force Basic.
 
-Login POSTs `{email, password}` (the username field defaults to `email`) and sends `Accept: application/json`. It tries `SUBHUB_LOGIN_PATH` first when that is set, then `/api/auth/login`, `/api/login`, and `/api/v1/login`, and stops at the first JSON body that contains a token (`token`, `access_token`, `data.token`, and the same names one level down). A 401 or 403 stops the search. HTML and 404 responses are recorded and the next path is tried. The token is cached in memory until the `expiry` on the login JSON (`expiry` may be a timestamp, unix seconds, seconds from now, or a date). `persistent: true` without an expiry lasts 12 hours. A missing expiry lasts one hour. Later requests reuse that token, including a page render and `/api/health` in the same process. A 401 refreshes it once. A 429 does not log in again. The token is never written to `/api/health` or the page.
+The sync job is the only caller of SubcontractorHub. Login POSTs `{email, password}` (the username field defaults to `email`) and sends `Accept: application/json`. It tries `SUBHUB_LOGIN_PATH` first when that is set, then `/api/auth/login`, `/api/login`, and `/api/v1/login`, and stops at the first JSON body that contains a token (`token`, `access_token`, `data.token`, and the same names one level down). A 401 or 403 stops the search. HTML and 404 responses are recorded and the next path is tried. The token is cached until its `expiry`. `persistent: true` without an expiry lasts 12 hours. A missing expiry lasts one hour. A 401 refreshes it once. A 429 does not log in again. The token is never written to `/api/health`, `/sync`, or the page.
 
-`GET /api/health` reports `demo`, `connected`, `auth failed`, or `unexpected body`, plus the auth mode. Login attempts are listed with path, upstream status, content type, and top-level keys. The token and the password are never included. When the orgs call answers, the JSON also includes `upstreamStatus`, `contentType`, `bodyKind`, `topLevelKeys`, `recordCount`, `hasNextCursor`, and a short `detail`. `recordCount` is the number of rows in `results.data` on that page (page size 50), not the `results` object. `hasNextCursor` is true when `next_cursor` is a non-empty string. The cursor value is not included. When the API sends `Retry-After` or `X-RateLimit-*`, those values are included as `rateLimit` (no token). A 429 snapshot is kept when a later response in the same process also sends rate-limit headers. HTTP 200 is demo, connected, or an unexpected body you can paste back. HTTP 401 means login did not yield a usable token. HTTP 503 means the API could not be reached or kept returning 429 after retries.
+`GET /api/health` reports the stored copy: `unconfigured`, `empty`, `ready`, or `error`, plus `orgs`, `dataAsOf`, and the latest `sync_runs` row. It does not call SubcontractorHub and it never includes a token or a database URL.
 
-Org and project lists use the superadmin wrapper `results.data`, with `results.next_cursor` sent back as `?cursor=`. Each request uses page size 50, follows `next_cursor` until it runs out, and stops after 40 pages (2,000 rows). Each request times out after 15 seconds. A 429 waits for `Retry-After` or `X-RateLimit-Reset`, otherwise exponential backoff with jitter, and retries at most four more times. Projects are read in one platform-wide list when each row includes an org id. Otherwise each org is requested one at a time, never in parallel. The crawl is cached for 30 minutes. Concurrent page renders share one in-flight crawl. If a refresh fails, the last snapshot stays on screen with a warning and a “Data as of” time. If projects fail and orgs succeed, the real orgs stay up and projects are marked unavailable. Manual date overrides are applied after that cache, so a saved date shows up immediately. The shell renders before the crawl finishes and the page shows “Loading the portfolio…”. Flat org fields (`street`, `city`, `state`, `postal_code`, `country`) and plan names are mapped. `Sales and Referrals Monthly` is the $500 monthly plan. `Solar Per Contract Sign` is the $35 per-contract plan. Other list shapes still parse. If the org list itself cannot be read and there is no snapshot yet, every page stays up on labeled demo data and the banner quotes the sanitized error.
+Org and project lists use the superadmin wrapper `results.data`, with `results.next_cursor` sent back as `?cursor=`. Each sync request uses page size 50. A 429 waits for `Retry-After` or `X-RateLimit-Reset`, otherwise exponential backoff with jitter, and retries at most four more times. Between pages the job waits at least 1.1 seconds so it stays under the observed 60 requests per minute. Projects are read in one platform-wide list when each row includes an org id. Otherwise each org is requested one at a time, never in parallel. One invocation stores a few pages and resumes from `sync_cursors`. If projects fail and orgs succeeded, the real orgs stay up and projects are marked unavailable. With no database, or an empty one, every page stays on labeled demo data. Flat org fields (`street`, `city`, `state`, `postal_code`, `country`) and plan names are mapped. `Sales and Referrals Monthly` is the $500 monthly plan. `Solar Per Contract Sign` is the $35 per-contract plan.
 
 Credentials are read only in server modules (`lib/api/client.ts` imports `server-only`). They are not sent to the browser. Errors include the status code, content type, body kind, top-level keys, and a short sanitized snippet. Secrets and email addresses are redacted.
 
@@ -64,7 +67,7 @@ Credentials are read only in server modules (`lib/api/client.ts` imports `server
 
 The Executive API does not yet return `onboarding_at`, `ready_to_launch_at`, or `launched_at` (request P0-1). In demo mode those dates are **proxy** stand-ins, badged on the page. `account_type` and failed-payment age are badged the same way.
 
-On an account page you can save a **manual** date. It is stored in `.data/overrides.json` (or `/tmp/cxm-overrides.json` if the project directory is not writable). A manual value is used only while the API field is empty. Clearing the override falls back to the proxy. On Vercel this file is ephemeral. The Postgres shapes for a later snapshot phase are in `lib/data/schema.ts`. Phase 1 does not need a database.
+On an account page you can save a **manual** date. It is stored in `.data/overrides.json` (or `/tmp/cxm-overrides.json` if the project directory is not writable). A manual value is used only while the API field is empty. Clearing the override falls back to the proxy. On Vercel this file is ephemeral. Daily account history (stage, project counts, health, pace) is written to `account_snapshots`.
 
 Checklist checks in the demo are also stand-ins. Live mode shows the template with nothing marked done.
 
@@ -97,19 +100,27 @@ Health v1 scores volume (75) and billing (25). Through day 60, volume follows pa
 npm test
 ```
 
-Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, API auth, Sanctum login paths (with `/api/auth/login` first), token expiry, `results.data` row counts and `next_cursor`, cursor pagination, the portfolio cache, plan and address mapping, sanitized API errors, and the demo fallback when the API body cannot be used.
+Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, API auth, Sanctum login paths (with `/api/auth/login` first), token expiry, `results.data` row counts and `next_cursor`, cursor pagination, plan and address mapping, sanitized API errors, the demo fallback when the database is empty, and the sync upsert and high-water rules.
 
-## Deploy on Vercel
+## Stored copy on Neon
 
-1. Import this repository. Framework preset is Next.js. Do not set a custom build command.
-2. In Project Settings → Environment Variables, set `SUBHUB_API_BASE_URL` to `https://api.virtualsaleportal.com` for production. The code default remains `https://app.subcontractorhub.com`.
-3. For a live environment, set `SUBHUB_API_USERNAME` to the Executive Leadership Read Only user's email and set `SUBHUB_API_PASSWORD`. Leave `SUBHUB_AUTH_MODE` as `auto`. Leave both unset on Preview if that deployment should stay on demo data. Put secrets in the Vercel UI. Do not paste them into chat or commit them.
-4. Leave `SUBHUB_LOGIN_PATH` blank. The first path tried is `/api/auth/login`. Set the variable only to force a different path, and read `loginAttempts` from `/api/health`.
-5. Set `DASHBOARD_PASSWORD` on any deployment other people can open. This is a placeholder until Google SSO and a role list (admin, CX leader, support, CXM).
-6. Deploy. `npm run build` is the production build. Open `/api/health` and expect `status: "connected"`, `mode: "login"`, and a `loginPath` when the service user is set.
+Pages and the agents hub read Postgres. A backfill pulls every superadmin list. A daily cron pulls what changed. Nothing in a page render calls SubcontractorHub.
 
-There is no cron sync and no database in this phase. Live org and project pages share a cached API read for about 30 minutes. A failed refresh keeps the last snapshot. Manual dates saved on that instance are applied on top of the cache.
+The deployed app applies `db/migrations/0001_sync.sql` itself. You do not run `npm run db:migrate` on a laptop. The statements are idempotent (`CREATE TABLE IF NOT EXISTS`). The setup and the first sync each take a Postgres transaction advisory lock (`pg_advisory_xact_lock`) so two callers cannot create the tables at the same time. A finished run records `0001_sync` in `schema_migrations`.
+
+`SUBHUB_API_BASE_URL` is `https://api.virtualsaleportal.com`. `SUBHUB_API_USERNAME` and `SUBHUB_API_PASSWORD` are the Executive Leadership Read Only user. Leave `SUBHUB_AUTH_MODE` as `auto`. Set `DASHBOARD_PASSWORD` so `/sync` is not public.
+
+1. Connect Neon from the Vercel project’s **Storage** tab. That sets `DATABASE_URL`. Do not paste the URL into chat or commit it.
+2. Add `CRON_SECRET` (a long random string). Vercel Cron sends it as `Authorization: Bearer <CRON_SECRET>`.
+3. Redeploy.
+4. Open `/sync`. The status line shows whether the database is connected, whether migrations have been applied, and whether `CRON_SECRET` is set. Those are booleans. The page never shows the secret.
+5. Click **Set up database**.
+6. Click **Run backfill now**. Each click stores a few pages and resumes from the cursor. Repeat until the cursors say Complete, or wait for the cron, which re-invokes itself until the pass is done or 80 hops. The first sync also applies the migration if the button was skipped.
+
+The crons in `vercel.json` are registered on production: `/api/cron/sync` at 09:00 UTC (2:00 AM Pacific during daylight time, 1:00 AM during standard time) and `/api/cron/orgs` hourly. Open `/` after the backfill. The banner says **Stored copy** and the line under it says **Data as of** the last successful sync. `/api/health` returns `status: "ready"` and `dataAsOf` once orgs are stored. It does not include the token.
+
+The daily job uses `updated_since` when the API accepts it. It does not today. See engineering request P0-5a. Until Ashish adds that filter, the job probes `updated_since`, `updated_after`, `from`, and `updated_at_from`, then `sort=-updated_at` and `sort=-created_at`. A 422 is recorded on the cursor and that param is not sent again. If none of those work, the daily pass waits and Sunday runs a full reconcile. Upserts are by id. A failed refresh leaves the last rows in place.
 
 ## Later
 
-Postgres snapshots (org snapshots, start dates, stage events, daily counts, checklist rows) replace the JSON stand-in and the per-request API reads. The engineering page tracks the API work those snapshots are waiting on. Agent cards stay placeholders until that data, and a human approval step, exist.
+Agent cards stay placeholders until a human approval step exists. Checklist rows and lifecycle dates still depend on the engineering requests.

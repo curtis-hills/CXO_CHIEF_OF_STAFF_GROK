@@ -4,19 +4,13 @@ import { SideNav } from "./side-nav";
 
 export async function ConnectionBanner() {
   const portfolio = await loadPortfolio();
-  if (portfolio.mode === "mock" && portfolio.notice) {
-    return (
-      <p>
-        <span className="font-semibold">Demo data.</span> The live API could not be read, so this is a labeled stand-in.{" "}
-        <span className="break-words">{portfolio.notice}</span>
-      </p>
-    );
-  }
   if (portfolio.mode === "mock") {
     return (
       <p>
-        <span className="font-semibold">Demo data.</span> API credentials are not set, so this is a labeled stand-in
-        portfolio. Lifecycle dates are proxies until engineering ships them.
+        <span className="font-semibold">Demo data.</span>{" "}
+        <span className="break-words">
+          {portfolio.notice ?? "The database is empty, so this is a labeled stand-in."}
+        </span>
       </p>
     );
   }
@@ -29,8 +23,8 @@ export async function ConnectionBanner() {
   }
   return (
     <p>
-      <span className="font-semibold">Live API.</span> Dates the API does not return yet stay blank unless someone saved a
-      manual stand-in.
+      <span className="font-semibold">Stored copy.</span> Pages read the last sync, not the live SubcontractorHub API.
+      Dates the API does not return yet stay blank unless someone saved a manual stand-in.
     </p>
   );
 }

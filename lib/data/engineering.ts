@@ -50,7 +50,17 @@ export const ENGINEERING_REQUESTS: EngineeringRequest[] = [
     title: "Sync basics",
     status: "draft",
     unblocks: "Hourly snapshots",
-    summary: "Document rate limits, add updated_after, raise the page size, publish OpenAPI.",
+    summary:
+      "The dashboard now stores its own copy and paces requests under the observed 60/minute limit. Still needed from the API: a documented rate limit, a page size above 50, and OpenAPI.",
+  },
+  {
+    id: "P0-5a",
+    priority: "P0",
+    title: "updated_since on every superadmin endpoint",
+    status: "draft",
+    unblocks: "Daily incremental sync",
+    summary:
+      "Ask for Ashish. The sync probes updated_since, updated_after, from, and updated_at_from, plus sort=-updated_at and sort=-created_at. None of these are in the documented API. A 422 marks that one param unsupported. Without updated_since, the daily job can only crawl newest-first and stop at a high-water mark, and Sunday runs a full reconcile. Paths the job calls besides orgs and projects: /api/v1/superadmin/financials, /api/v1/superadmin/esign-status, and /api/v1/superadmin/commissions. A 404 marks that path unsupported until the real path is confirmed.",
   },
   {
     id: "P0-6",
