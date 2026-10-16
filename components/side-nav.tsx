@@ -11,6 +11,7 @@ const LINKS = [
   { href: "/actions", label: "Action queue" },
   { href: "/agents", label: "Agents" },
   { href: "/engineering", label: "Engineering" },
+  { href: "/sync", label: "Sync" },
 ];
 
 export function SideNav({ alertCount }: { alertCount: number }) {

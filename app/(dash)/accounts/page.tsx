@@ -19,11 +19,18 @@ export default async function CohortPage({
   const status = one(query.status);
   const cxm = one(query.cxm);
   const type = one(query.type);
+  const stage = one(query.stage);
+  const health = one(query.health);
+  const from = one(query.from);
+  const to = one(query.to);
   const cxms = [...new Set(portfolio.accounts.map((account) => account.cxm?.name).filter((name): name is string => Boolean(name)))].sort();
 
-  const rows = cohortAccounts(portfolio.accounts)
+  const pool = stage ? portfolio.accounts.filter((account) => account.stage === stage) : cohortAccounts(portfolio.accounts);
+  const rows = pool
     .filter((account) => !status || account.pace?.status === status || (status === "missing" && !account.pace))
     .filter((account) => !cxm || account.cxm?.name === cxm)
+    .filter((account) => !health || account.health.band === health)
+    .filter((account) => inRange(account.launchedAt.iso, from, to))
     .filter((account) => {
       if (!type) return true;
       if (type === "seamless_dealer") return account.legacySeamlessDealer;
@@ -62,6 +69,36 @@ export default async function CohortPage({
             <option value="seamless_dealer">Seamless Dealer (legacy)</option>
             <option value="seamless_installing_dealer">Seamless Installing Dealer</option>
           </select>
+        </label>
+        <label className="text-xs text-muted">
+          Stage
+          <select name="stage" defaultValue={stage} className="field mt-1 block">
+            <option value="">Launched cohort</option>
+            <option value="onboarding">Onboarding</option>
+            <option value="ready_to_launch">Ready to Launch</option>
+            <option value="launched">Launched</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
+        <label className="text-xs text-muted">
+          Health
+          <select name="health" defaultValue={health} className="field mt-1 block">
+            <option value="">All</option>
+            <option value="green">Green</option>
+            <option value="yellow">Yellow</option>
+            <option value="red">Red</option>
+            <option value="ramping">Ramping</option>
+            <option value="unscored">Unscored</option>
+            <option value="prelaunch">Pre-launch</option>
+          </select>
+        </label>
+        <label className="text-xs text-muted">
+          Launched from
+          <input name="from" type="date" defaultValue={from} className="field mt-1 block" />
+        </label>
+        <label className="text-xs text-muted">
+          Launched to
+          <input name="to" type="date" defaultValue={to} className="field mt-1 block" />
         </label>
         <label className="text-xs text-muted">
           CXM
@@ -107,6 +144,15 @@ export default async function CohortPage({
       </div>
     </>
   );
+}
+
+function inRange(iso: string | null, from: string, to: string): boolean {
+  if (!from && !to) return true;
+  if (!iso) return false;
+  const day = iso.slice(0, 10);
+  if (from && day < from) return false;
+  if (to && day > to) return false;
+  return true;
 }
 
 function CohortRow({ account }: { account: Account }) {

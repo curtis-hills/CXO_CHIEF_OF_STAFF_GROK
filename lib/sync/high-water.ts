@@ -1,0 +1,147 @@
+import { FILTER_PARAMS, SORT_PARAMS, type FilterParam, type SortParam } from "./catalog";
+
+export type SyncQuery = {
+  params: Record<string, string>;
+  filter: FilterParam | null;
+  sort: SortParam | null;
+};
+
+const MIN_GAP_MS = 1_100;
+
+export function rowActivityAt(row: unknown): string | null {
+  if (!row || typeof row !== "object") return null;
+  const record = row as Record<string, unknown>;
+  for (const key of ["updated_at", "updatedAt", "created_at", "createdAt"]) {
+    const value = record[key];
+    if (typeof value === "string" && Number.isFinite(Date.parse(value))) return new Date(Date.parse(value)).toISOString();
+  }
+  return null;
+}
+
+/** Moves the mark forward to the newest updated_at / created_at in the page. Never backward. */
+export function advanceHighWater(current: string | null, rows: unknown[]): string | null {
+  let bestMs = current ? Date.parse(current) : Number.NaN;
+  let bestIso = current && Number.isFinite(bestMs) ? new Date(bestMs).toISOString() : null;
+  for (const row of rows) {
+    const iso = rowActivityAt(row);
+    if (!iso) continue;
+    const ms = Date.parse(iso);
+    if (!Number.isFinite(bestMs) || ms > bestMs) {
+      bestMs = ms;
+      bestIso = iso;
+    }
+  }
+  return bestIso;
+}
+
+export function pageOrder(rows: unknown[]): "newest-first" | "oldest-first" | "unknown" {
+  const times = rows
+    .map((row) => rowActivityAt(row))
+    .map((iso) => (iso ? Date.parse(iso) : Number.NaN))
+    .filter((ms) => Number.isFinite(ms));
+  if (times.length < 2) return "unknown";
+  if (times[0] > times[times.length - 1]) return "newest-first";
+  if (times[0] < times[times.length - 1]) return "oldest-first";
+  return "unknown";
+}
+
+/**
+ * On a newest-first page, rows after the high-water mark are already stored.
+ * Oldest-first pages are not cut off here: stopping would drop newer rows that sit at the end.
+ */
+export function splitAtHighWater(
+  rows: unknown[],
+  highWater: string | null,
+  order: "newest-first" | "oldest-first" | "unknown",
+): { fresh: unknown[]; reached: boolean } {
+  if (!highWater || order !== "newest-first") return { fresh: rows, reached: false };
+  const mark = Date.parse(highWater);
+  if (!Number.isFinite(mark)) return { fresh: rows, reached: false };
+  const fresh: unknown[] = [];
+  for (const row of rows) {
+    const iso = rowActivityAt(row);
+    if (!iso) {
+      fresh.push(row);
+      continue;
+    }
+    if (Date.parse(iso) > mark) fresh.push(row);
+    else return { fresh, reached: true };
+  }
+  return { fresh, reached: false };
+}
+
+export function nextFilter(unsupported: readonly string[]): FilterParam | null {
+  return FILTER_PARAMS.find((param) => !unsupported.includes(param)) ?? null;
+}
+
+export function nextSort(unsupported: readonly string[]): SortParam | null {
+  return SORT_PARAMS.find((param) => !unsupported.includes(param)) ?? null;
+}
+
+export function selectSyncQuery(input: {
+  mode: "backfill" | "incremental";
+  full: boolean;
+  highWater: string | null;
+  cursor: string | null;
+  page: number | null;
+  orgId?: string | null;
+  unsupportedFilters: readonly string[];
+  unsupportedSorts: readonly string[];
+}): SyncQuery {
+  const params: Record<string, string> = {};
+  if (input.cursor) params.cursor = input.cursor;
+  if (input.page) params.page = String(input.page);
+  if (input.orgId) params.org_id = input.orgId;
+  if (input.mode === "backfill" || input.full || !input.highWater) {
+    return { params, filter: null, sort: null };
+  }
+  const filter = nextFilter(input.unsupportedFilters);
+  if (filter) {
+    params[filter] = input.highWater;
+    return { params, filter, sort: null };
+  }
+  const sort = nextSort(input.unsupportedSorts);
+  if (sort) {
+    params.sort = sort;
+    return { params, filter: null, sort };
+  }
+  return { params, filter: null, sort: null };
+}
+
+/** Stay under the observed 60 requests/minute. A nearly empty remaining count waits for the reset. */
+export function paceDelayMs(remaining: string | null, reset: string | null, now = Date.now()): number {
+  const left = remaining && /^\d+$/.test(remaining) ? Number(remaining) : null;
+  if (left !== null && left <= 1 && reset && /^\d+$/.test(reset)) {
+    const value = Number(reset);
+    const at = value >= 1e12 ? value : value >= 1e9 ? value * 1000 : now + value * 1000;
+    const wait = at - now;
+    if (Number.isFinite(wait) && wait > MIN_GAP_MS) return Math.min(60_000, wait);
+  }
+  return MIN_GAP_MS;
+}
+
+export function pacificDay(now: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+export function shouldFullReconcile(now: Date, lastReconcileDay: string | null): boolean {
+  const weekday = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", weekday: "short" }).format(now);
+  if (weekday !== "Sun") return false;
+  return lastReconcileDay !== pacificDay(now);
+}
+
+export function upsertById<T extends { id: string }>(existing: Map<string, T>, rows: T[]): { inserted: number; updated: number } {
+  let inserted = 0;
+  let updated = 0;
+  for (const row of rows) {
+    if (existing.has(row.id)) updated += 1;
+    else inserted += 1;
+    existing.set(row.id, row);
+  }
+  return { inserted, updated };
+}

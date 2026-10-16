@@ -1,10 +1,14 @@
 import Link from "next/link";
 import { Chip, PageHeader } from "@/components/ui";
 import { AGENTS, coveragePercent, type AgentProfile } from "@/lib/data/agents";
+import { loadPortfolio } from "@/lib/data/load";
+import { formatUtcTimestamp } from "@/lib/metrics/calendar";
 
 export const metadata = { title: "Agents" };
 
-export default function AgentsPage() {
+export default async function AgentsPage() {
+  const portfolio = await loadPortfolio();
+  const stamp = portfolio.dataAsOf ? formatUtcTimestamp(portfolio.dataAsOf) : null;
   return (
     <>
       <PageHeader
@@ -12,6 +16,11 @@ export default function AgentsPage() {
         title="Planned roster"
         lede="None of these agents are running. Each card is a placeholder with the data it would need. Agents draft. A human approves every customer message and every billing or account change. Agents never see secrets. The CXM Admin agent does setup later. It does not set Launched."
       />
+      <p className="mb-4 text-sm text-muted">
+        {portfolio.mode === "mock"
+          ? "Demo data. The agent roster is not scoring a synced account list yet."
+          : `Stored copy · ${portfolio.accounts.length} accounts${stamp ? ` · Data as of ${stamp}` : ""}.`}
+      </p>
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         {AGENTS.map((agent) => (
           <AgentCard key={agent.slug} agent={agent} />

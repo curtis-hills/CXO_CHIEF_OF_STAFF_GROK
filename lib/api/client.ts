@@ -2,6 +2,7 @@ import "server-only";
 
 import {
   collectAll,
+  collectionFromPayload,
   emptySummary,
   inspectResponse,
   SubhubApiError,
@@ -19,6 +20,7 @@ import {
   type ConnectionReport,
 } from "./session";
 import { PAGE_SIZE } from "./limits";
+import { readRateLimitHeaders, type RateLimitSnapshot } from "./rate-limit";
 import type { ApiOrg, ApiProject } from "./types";
 import { clearLiveInputsCache } from "../data/live-cache";
 
@@ -82,7 +84,7 @@ function configuredSecrets(): string[] {
 async function readPayload(
   path: string,
   search?: Record<string, string | number | undefined>,
-): Promise<{ payload: unknown; summary: ResponseSummary; status: number }> {
+): Promise<{ payload: unknown; summary: ResponseSummary; status: number; rateLimit: RateLimitSnapshot | null }> {
   let response: Response;
   try {
     ({ response } = await currentSession().request(path, search));
@@ -90,12 +92,14 @@ async function readPayload(
     if (error instanceof AuthRejectedError) throw new SubhubApiError(401, path, emptySummary("credentials rejected"));
     throw error;
   }
+  const secrets = configuredSecrets();
+  const rateLimit = readRateLimitHeaders(response.headers, response.status, secrets);
   const text = await response.text();
-  const { summary, payload } = inspectResponse(response.headers.get("content-type"), text, configuredSecrets());
+  const { summary, payload } = inspectResponse(response.headers.get("content-type"), text, secrets);
   if (!response.ok || (response.status >= 300 && response.status < 400) || summary.bodyKind !== "json" || payload === null) {
     throw new SubhubApiError(response.status, path, summary);
   }
-  return { payload, summary, status: response.status };
+  return { payload, summary, status: response.status, rateLimit };
 }
 
 export async function fetchAllPages<T>(
@@ -116,6 +120,23 @@ export async function fetchAllPages<T>(
     }
     throw error;
   }
+}
+
+export type CollectionPage<T> = {
+  items: T[];
+  next: PageQuery | null;
+  rateLimit: RateLimitSnapshot | null;
+};
+
+/** One page. The sync job checkpoints the cursor between pages. */
+export async function fetchCollectionPage<T>(
+  path: string,
+  params: Record<string, string | number | undefined> = {},
+): Promise<CollectionPage<T>> {
+  const read = await readPayload(path, { limit: PAGE_SIZE, ...params });
+  const collection = collectionFromPayload<T>(read.payload);
+  if (!collection) throw new UnrecognizedCollectionError(read.payload);
+  return { items: collection.items, next: collection.next, rateLimit: read.rateLimit };
 }
 
 export async function fetchOrgs(): Promise<ApiOrg[]> {

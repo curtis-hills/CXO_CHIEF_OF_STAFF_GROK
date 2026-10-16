@@ -17,8 +17,25 @@ export default async function HealthPage({
 }) {
   const query = await searchParams;
   const band = one(query.band);
+  const type = one(query.type);
+  const from = one(query.from);
+  const to = one(query.to);
   const portfolio = await loadPortfolio();
   const rows = launchedAccounts(portfolio.accounts)
+    .filter((account) => {
+      if (!type) return true;
+      if (type === "seamless_dealer") return account.legacySeamlessDealer;
+      if (type === "sales_org") return account.accountType === "sales_org" && !account.legacySeamlessDealer;
+      return account.accountType === type;
+    })
+    .filter((account) => {
+      if (!from && !to) return true;
+      const day = account.launchedAt.iso?.slice(0, 10);
+      if (!day) return false;
+      if (from && day < from) return false;
+      if (to && day > to) return false;
+      return true;
+    })
     .filter((account) => !band || account.health.band === band)
     .sort((a, b) => ORDER.indexOf(a.health.band) - ORDER.indexOf(b.health.band) || (a.health.score ?? 999) - (b.health.score ?? 999));
 
@@ -31,10 +48,34 @@ export default async function HealthPage({
         title="Volume trend and billing"
         lede="v1 uses only two inputs. Volume is worth 75 points and billing 25, the 30/10 weights from the fuller model stretched onto 100. Through day 60, volume follows pace: on pace or achieved is full credit, watch is half, at risk or missed is none. After day 60, volume is the last 30 days compared with the trailing 90-day monthly average. At least 100% is full credit, 60–99% is half, and under 60% is none. A failed or past-due payment scores no billing points. A failed payment open 7 days or more, or a cancellation, forces Red even when the points are higher. Green is 70 or above. Yellow is 45–69. Red is under 45."
       />
+      <form className="mb-4 flex flex-wrap items-end gap-3" method="get">
+        {band ? <input type="hidden" name="band" value={band} /> : null}
+        <label className="text-xs text-muted">
+          Type
+          <select name="type" defaultValue={type} className="field mt-1 block">
+            <option value="">All</option>
+            <option value="epc">EPC</option>
+            <option value="sales_org">Sales Org</option>
+            <option value="seamless_dealer">Seamless Dealer (legacy)</option>
+            <option value="seamless_installing_dealer">Seamless Installing Dealer</option>
+          </select>
+        </label>
+        <label className="text-xs text-muted">
+          Launched from
+          <input name="from" type="date" defaultValue={from} className="field mt-1 block" />
+        </label>
+        <label className="text-xs text-muted">
+          Launched to
+          <input name="to" type="date" defaultValue={to} className="field mt-1 block" />
+        </label>
+        <button type="submit" className="rounded-md bg-navy px-3 py-2 text-sm text-white">
+          Filter
+        </button>
+      </form>
       <div className="mb-4 flex flex-wrap gap-2 text-sm">
-        <FilterLink href="/health" current={!band} label={`All ${launchedAccounts(portfolio.accounts).length}`} />
+        <FilterLink href={healthHref("", type, from, to)} current={!band} label={`All ${launchedAccounts(portfolio.accounts).length}`} />
         {ORDER.filter((key) => (counts[key] ?? 0) > 0).map((key) => (
-          <FilterLink key={key} href={`/health?band=${key}`} current={band === key} label={`${healthLabel(key)} ${counts[key]}`} />
+          <FilterLink key={key} href={healthHref(key, type, from, to)} current={band === key} label={`${healthLabel(key)} ${counts[key]}`} />
         ))}
       </div>
       <div className="overflow-x-auto rounded-lg border border-line bg-card">
@@ -94,6 +135,16 @@ function HealthRow({ account }: { account: Account }) {
       <td className="max-w-sm text-xs leading-5 text-muted">{account.health.drivers[0]}</td>
     </tr>
   );
+}
+
+function healthHref(band: string, type: string, from: string, to: string): string {
+  const params = new URLSearchParams();
+  if (band) params.set("band", band);
+  if (type) params.set("type", type);
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  const query = params.toString();
+  return query ? `/health?${query}` : "/health";
 }
 
 function FilterLink({ href, label, current }: { href: string; label: string; current: boolean }) {

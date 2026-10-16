@@ -1,7 +1,6 @@
 /**
- * Postgres shapes for a later snapshot phase.
- * Phase 1 does not open a database. Pages call the Executive API (or demo data)
- * on each request. Manual date stand-ins are a JSON file until these tables exist.
+ * Earlier notes for the snapshot phase. The tables that are actually created
+ * live in db/migrations/0001_sync.sql. Pages read that stored copy.
  */
 
 export type OrgSnapshotRow = {

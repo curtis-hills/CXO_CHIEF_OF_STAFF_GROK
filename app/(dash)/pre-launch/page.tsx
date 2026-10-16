@@ -20,6 +20,8 @@ export default async function PrelaunchPage({
   const portfolio = await loadPortfolio();
   const type = one(query.type);
   const cxm = one(query.cxm);
+  const from = one(query.from);
+  const to = one(query.to);
   const cxms = uniqueCxms(portfolio.accounts);
 
   const lanes = LANES.map((lane) => {
@@ -27,6 +29,14 @@ export default async function PrelaunchPage({
       .filter((account) => account.stage === lane.id)
       .filter((account) => matchesType(account, type))
       .filter((account) => !cxm || account.cxm?.name === cxm || (cxm === "unassigned" && !account.cxm))
+      .filter((account) => {
+        if (!from && !to) return true;
+        const day = account.onboardingAt.iso?.slice(0, 10);
+        if (!day) return false;
+        if (from && day < from) return false;
+        if (to && day > to) return false;
+        return true;
+      })
       .sort((a, b) => (b.stageTiming.businessDaysInStage ?? -1) - (a.stageTiming.businessDaysInStage ?? -1));
     return { ...lane, cards };
   });
@@ -58,6 +68,14 @@ export default async function PrelaunchPage({
               <option key={name}>{name}</option>
             ))}
           </select>
+        </label>
+        <label className="text-xs text-muted">
+          Onboarding from
+          <input name="from" type="date" defaultValue={from} className="field mt-1 block" />
+        </label>
+        <label className="text-xs text-muted">
+          Onboarding to
+          <input name="to" type="date" defaultValue={to} className="field mt-1 block" />
         </label>
         <button type="submit" className="rounded-md bg-navy px-3 py-2 text-sm text-white">
           Filter
