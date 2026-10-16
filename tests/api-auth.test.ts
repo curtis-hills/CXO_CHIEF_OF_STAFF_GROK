@@ -5,6 +5,7 @@ import {
   basicAuthorization,
   readApiAuthConfig,
   redactSecrets,
+  resolveTokenExpiry,
   type ApiAuthConfig,
 } from "../lib/api/session";
 
@@ -48,9 +49,18 @@ describe("API auth", () => {
       },
     );
     const report = await session.probe();
-    expect(report).toMatchObject({ status: "connected", mode: "bearer", httpStatus: 200, bodyKind: "json", recordCount: 0 });
+    expect(report).toMatchObject({
+      status: "connected",
+      mode: "bearer",
+      httpStatus: 200,
+      bodyKind: "json",
+      recordCount: 0,
+      hasNextCursor: false,
+    });
     expect(headersOf(calls[0]?.init).get("authorization")).toBe(`Bearer ${API_KEY}`);
     expect(calls[0]?.url).toContain("https://app.subcontractorhub.com/api/v1/superadmin/orgs");
+    expect(new URL(calls[0]?.url ?? "").searchParams.get("limit")).toBe("100");
+    expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
   });
 
   it("sends HTTP Basic auth", async () => {
@@ -107,7 +117,7 @@ describe("API auth", () => {
       return json({ results: { data: [] } });
     });
     expect((await login.probe()).mode).toBe("login");
-    expect(posts).toEqual(["/api/login"]);
+    expect(posts).toEqual(["/api/auth/login"]);
     expect((await bearer.probe()).mode).toBe("bearer");
   });
 
@@ -119,7 +129,7 @@ describe("API auth", () => {
     });
     const report = await session.probe();
     expect(report).toMatchObject({ status: "auth failed", httpStatus: 401, mode: "login" });
-    expect(posts).toEqual(["/api/login"]);
+    expect(posts).toEqual(["/api/auth/login"]);
     expect(JSON.stringify(report)).not.toContain(PASSWORD);
   });
 
@@ -138,8 +148,8 @@ describe("API auth", () => {
             headers: { "content-type": "text/html" },
           });
         }
-        if (path === "/api/login") return new Response("missing", { status: 404, headers: { "content-type": "application/json" } });
-        if (path === "/api/v1/login") return json({ data: { access_token: "sanctum-plain-9f3c" } });
+        if (path === "/api/auth/login") return new Response("missing", { status: 404, headers: { "content-type": "application/json" } });
+        if (path === "/api/login") return json({ data: { access_token: "sanctum-plain-9f3c" } });
         return new Response("no", { status: 404 });
       }
       expect(headersOf(init).get("authorization")).toBe("Bearer sanctum-plain-9f3c");
@@ -152,17 +162,17 @@ describe("API auth", () => {
       });
     });
     const report = await session.probe();
-    expect(posts).toEqual(["/custom/login", "/api/login", "/api/v1/login"]);
-    expect(report).toMatchObject({ status: "connected", mode: "login", loginPath: "/api/v1/login" });
+    expect(posts).toEqual(["/custom/login", "/api/auth/login", "/api/login"]);
+    expect(report).toMatchObject({ status: "connected", mode: "login", loginPath: "/api/login" });
     expect(report.loginAttempts).toEqual([
       expect.objectContaining({ path: "/custom/login", upstreamStatus: 200, contentType: "text/html", bodyKind: "html" }),
-      expect.objectContaining({ path: "/api/login", upstreamStatus: 404, bodyKind: "text" }),
-      expect.objectContaining({ path: "/api/v1/login", upstreamStatus: 200, contentType: "application/json", topLevelKeys: ["data"] }),
+      expect.objectContaining({ path: "/api/auth/login", upstreamStatus: 404, bodyKind: "text" }),
+      expect.objectContaining({ path: "/api/login", upstreamStatus: 200, contentType: "application/json", topLevelKeys: ["data"] }),
     ]);
     expect(JSON.stringify(report)).not.toContain("sanctum-plain-9f3c");
     expect(JSON.stringify(report)).not.toContain(PASSWORD);
     const pasted = healthPayload(report);
-    expect(pasted.loginPath).toBe("/api/v1/login");
+    expect(pasted.loginPath).toBe("/api/login");
     expect(pasted.loginAttempts).toHaveLength(3);
     expect(JSON.stringify(pasted)).not.toContain("sanctum-plain-9f3c");
   });
@@ -192,7 +202,7 @@ describe("API auth", () => {
   it("does not re-login a third time when the refreshed token is also rejected", async () => {
     let logins = 0;
     const session = new ApiSession(config({ mode: "login" }), async (url) => {
-      if (url.endsWith("/api/login")) {
+      if (url.endsWith("/api/auth/login")) {
         logins += 1;
         return json({ token: `token-${logins}` });
       }
@@ -206,7 +216,7 @@ describe("API auth", () => {
   it("shares one in-flight login across parallel requests", async () => {
     let logins = 0;
     const session = new ApiSession(config({ mode: "login" }), async (url) => {
-      if (url.endsWith("/api/login")) {
+      if (url.endsWith("/api/auth/login")) {
         logins += 1;
         await new Promise((resolve) => setTimeout(resolve, 20));
         return json({ token: "shared-token" });
@@ -228,7 +238,7 @@ describe("API auth", () => {
     await expect(exploding.probe()).resolves.toMatchObject({ status: "auth failed", httpStatus: 503 });
 
     const login = new ApiSession(config({ mode: "login" }), async (url) => {
-      if (url.endsWith("/api/login")) {
+      if (url.endsWith("/api/auth/login")) {
         return new Response(JSON.stringify({ message: PASSWORD, token: API_KEY }), { status: 401 });
       }
       return new Response("no", { status: 401 });
@@ -255,6 +265,44 @@ describe("API auth", () => {
   it("reports auth failed when an explicit mode is missing credentials", async () => {
     const session = new ApiSession(config({ mode: "basic", username: "", password: "" }), async () => json({}));
     expect(await session.probe()).toEqual({ status: "auth failed", httpStatus: 401 });
+  });
+
+  it("keeps a token until its expiry, then logs in again", async () => {
+    let logins = 0;
+    const fresh = new ApiSession(config({ mode: "login", loginPath: "/api/auth/login" }), async (url, init) => {
+      if ((init?.method ?? "GET") === "POST") {
+        logins += 1;
+        return json({ token: `token-${logins}`, expiry: Math.floor(Date.now() / 1000) + 3600, persistent: true });
+      }
+      return json({ results: { data: [{ id: 1 }, { id: 2 }], next_cursor: null } });
+    });
+    expect((await fresh.probe()).recordCount).toBe(2);
+    expect((await fresh.probe()).hasNextCursor).toBe(false);
+    expect(logins).toBe(1);
+
+    logins = 0;
+    const stale = new ApiSession(config({ mode: "login", loginPath: "/api/auth/login" }), async (_url, init) => {
+      if ((init?.method ?? "GET") === "POST") {
+        logins += 1;
+        return json({ token: `token-${logins}`, expiry: 1_600_000_000 });
+      }
+      return json({ results: { data: [] } });
+    });
+    expect((await stale.probe()).status).toBe("connected");
+    expect((await stale.probe()).status).toBe("connected");
+    expect(logins).toBe(2);
+  });
+
+  it("reads expiry as a timestamp, a duration, a date, or a persistent flag", () => {
+    const now = 1_700_000_000_000;
+    expect(resolveTokenExpiry({ expiry: 1_700_003_600 }, now)).toBe(1_700_003_600_000 - 60_000);
+    expect(resolveTokenExpiry({ expiry: now + 3_600_000 }, now)).toBe(now + 3_600_000 - 60_000);
+    expect(resolveTokenExpiry({ expiry: 3600 }, now)).toBe(now + 3_600_000 - 60_000);
+    expect(resolveTokenExpiry({ expiry: "3600" }, now)).toBe(now + 3_600_000 - 60_000);
+    expect(resolveTokenExpiry({ expiry: new Date(now + 3_600_000).toISOString() }, now)).toBe(now + 3_600_000 - 60_000);
+    expect(resolveTokenExpiry({ expiry: 90 }, now)).toBe(now + 90_000);
+    expect(resolveTokenExpiry({ persistent: true }, now)).toBe(now + 12 * 60 * 60 * 1000);
+    expect(resolveTokenExpiry({ token: "abc" }, now)).toBe(now + 60 * 60 * 1000);
   });
 
   it("rejects header injection in credentials", () => {

@@ -2,9 +2,10 @@ import "server-only";
 
 import { cache } from "react";
 import { connectionNotice } from "../api/body";
-import { fetchOrgs, fetchProjectsByOrg, getApiConfig } from "../api/client";
+import { getApiConfig } from "../api/client";
 import type { Account, Alert } from "../domain";
 import { assemblePortfolio } from "./assemble";
+import { getLiveInputs } from "./live-cache";
 import { buildMockInputs } from "./mock";
 import { readOverrides } from "./overrides";
 
@@ -37,8 +38,7 @@ export async function readPortfolio(): Promise<Portfolio> {
     const config = getApiConfig();
     if (!config.live) return demoPortfolio(asOf, overrides, null);
 
-    const orgs = await fetchOrgs();
-    const projectsByOrg = await fetchProjectsByOrg(orgs.map((org) => String(org.id)));
+    const { orgs, projectsByOrg } = await getLiveInputs();
     const assembled = assemblePortfolio({
       mode: "live",
       asOf,

@@ -5,13 +5,18 @@
  */
 
 import { inspectResponse, redactSecrets } from "./body";
+import { PAGE_SIZE, REQUEST_TIMEOUT_MS } from "./limits";
 
 export { redactSecrets };
 
 export const DEFAULT_BASE_URL = "https://app.subcontractorhub.com";
 export const DEFAULT_KEY_HEADER = "X-API-Key";
-export const DEFAULT_LOGIN_PATH = "/api/login";
-export const DEFAULT_LOGIN_PATHS = ["/api/login", "/api/v1/login", "/api/auth/login"] as const;
+export const DEFAULT_LOGIN_PATH = "/api/auth/login";
+export const DEFAULT_LOGIN_PATHS = ["/api/auth/login", "/api/login", "/api/v1/login"] as const;
+const TOKEN_SKEW_MS = 60_000;
+const TOKEN_SKEW_MIN_LIFE_MS = 120_000;
+const TOKEN_FALLBACK_MS = 60 * 60 * 1000;
+const TOKEN_PERSISTENT_MS = 12 * 60 * 60 * 1000;
 
 export type AuthModeName = "bearer" | "basic" | "basic+key" | "login";
 export type AuthModeSetting = "auto" | AuthModeName;
@@ -48,6 +53,8 @@ export type ConnectionReport = {
   bodyKind?: "html" | "json" | "text" | "empty";
   topLevelKeys?: string[];
   recordCount?: number | null;
+  /** Whether the orgs page included a non-empty next_cursor. The cursor itself is omitted. */
+  hasNextCursor?: boolean;
   detail?: string;
   /** Login path that returned a token. */
   loginPath?: string;
@@ -180,6 +187,7 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export class ApiSession {
   private token: string | null = null;
+  private tokenExpiresAt: number | null = null;
   private inflight: Promise<string> | null = null;
   private inflightGeneration = 0;
   private generation = 0;
@@ -202,7 +210,7 @@ export class ApiSession {
     if (intent === "demo") return { status: "demo", httpStatus: 200 };
     if (intent === "incomplete") return { status: "auth failed", httpStatus: 401 };
     try {
-      const { response, mode } = await this.request("/api/v1/superadmin/orgs", { limit: 1 });
+      const { response, mode } = await this.request("/api/v1/superadmin/orgs", { limit: PAGE_SIZE });
       const text = await response.text();
       const { summary } = inspectResponse(response.headers.get("content-type"), text, [this.config.apiKey, this.config.password]);
       const diagnostic = {
@@ -212,6 +220,7 @@ export class ApiSession {
         bodyKind: summary.bodyKind,
         topLevelKeys: summary.topLevelKeys,
         recordCount: summary.recordCount,
+        hasNextCursor: summary.hasNextCursor,
         detail: summary.detail,
         ...this.loginMeta(),
       };
@@ -272,7 +281,12 @@ export class ApiSession {
     const headers = new Headers({ Accept: "application/json" });
     this.applyAuth(headers, mode, token);
     try {
-      return await this.fetchImpl(url.toString(), { headers, cache: "no-store", redirect: "manual" });
+      return await this.fetchImpl(url.toString(), {
+        headers,
+        cache: "no-store",
+        redirect: "manual",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "SubcontractorHub request failed.";
       throw new Error(redactSecrets(message, [this.config.apiKey, this.config.password, token]));
@@ -298,14 +312,26 @@ export class ApiSession {
     headers.set("Authorization", `Bearer ${token}`);
   }
 
+  private tokenExpired(): boolean {
+    return this.tokenExpiresAt !== null && Date.now() >= this.tokenExpiresAt;
+  }
+
   private async getToken(force: boolean): Promise<string> {
-    if (!force && this.token) return this.token;
-    const generation = force ? ++this.generation : this.generation;
+    if (!force && this.token && !this.tokenExpired()) return this.token;
+    const refresh = force || (this.token !== null && this.tokenExpired());
+    if (refresh) {
+      this.token = null;
+      this.tokenExpiresAt = null;
+    }
+    const generation = refresh ? ++this.generation : this.generation;
     if (this.inflight && this.inflightGeneration === generation) return this.inflight;
     this.inflightGeneration = generation;
-    const pending = this.login().then((token) => {
-      if (this.generation === generation) this.token = token;
-      return token;
+    const pending = this.login().then((issued) => {
+      if (this.generation === generation) {
+        this.token = issued.token;
+        this.tokenExpiresAt = issued.expiresAt;
+      }
+      return issued.token;
     });
     this.inflight = pending;
     try {
@@ -325,7 +351,7 @@ export class ApiSession {
     return body;
   }
 
-  private async login(): Promise<string> {
+  private async login(): Promise<{ token: string; expiresAt: number }> {
     this.loginAttempts = [];
     this.loginPathUsed = null;
     let rejected = false;
@@ -334,7 +360,7 @@ export class ApiSession {
       this.loginAttempts.push(result.attempt);
       if (result.token) {
         this.loginPathUsed = path;
-        return result.token;
+        return { token: result.token, expiresAt: result.expiresAt };
       }
       if (result.rejected) {
         rejected = true;
@@ -345,7 +371,7 @@ export class ApiSession {
     throw new AuthRejectedError();
   }
 
-  private async postLogin(path: string): Promise<{ token: string | null; rejected: boolean; attempt: LoginAttemptReport }> {
+  private async postLogin(path: string): Promise<{ token: string | null; expiresAt: number; rejected: boolean; attempt: LoginAttemptReport }> {
     let response: Response;
     try {
       response = await this.fetchImpl(loginUrl(this.config, path), {
@@ -354,6 +380,7 @@ export class ApiSession {
         body: JSON.stringify(this.loginBody()),
         cache: "no-store",
         redirect: "manual",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "SubcontractorHub login failed.";
@@ -368,10 +395,62 @@ export class ApiSession {
       bodyKind: summary.bodyKind,
       topLevelKeys: summary.topLevelKeys,
     };
-    if (response.status === 401 || response.status === 403) return { token: null, rejected: true, attempt };
-    if (!response.ok) return { token: null, rejected: false, attempt };
-    return { token: extractToken(text), rejected: false, attempt };
+    const missed = { token: null, expiresAt: 0, rejected: false, attempt };
+    if (response.status === 401 || response.status === 403) return { ...missed, rejected: true };
+    if (!response.ok) return missed;
+    const token = extractToken(text);
+    return { token, expiresAt: resolveTokenExpiry(parseJson(text), Date.now()), rejected: false, attempt };
   }
+}
+
+/**
+ * Absolute time, in ms, when a login token should be treated as expired.
+ * `expiry` may be a ms timestamp, unix seconds, seconds from now, or a date string.
+ * A lifetime longer than two minutes is shortened by 60 seconds. `persistent` without
+ * an expiry lasts 12 hours. Anything else lasts one hour, and a 401 still forces a refresh.
+ */
+export function resolveTokenExpiry(payload: unknown, now = Date.now()): number {
+  const record = isRecord(payload) ? payload : {};
+  const persistent = record.persistent === true;
+  const absolute = absoluteExpiry(record.expiry ?? record.expires_at ?? record.expiresAt, now);
+  if (absolute !== null) {
+    const life = absolute - now;
+    if (life > TOKEN_SKEW_MIN_LIFE_MS) return absolute - TOKEN_SKEW_MS;
+    return absolute;
+  }
+  if (persistent) return now + TOKEN_PERSISTENT_MS;
+  return now + TOKEN_FALLBACK_MS;
+}
+
+function absoluteExpiry(value: unknown, now: number): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return expiryFromNumber(value, now);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (/^-?\d+(\.\d+)?$/.test(trimmed)) return expiryFromNumber(Number(trimmed), now);
+    const parsed = Date.parse(trimmed);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function expiryFromNumber(value: number, now: number): number | null {
+  if (!(value > 0)) return null;
+  if (value >= 1e12) return value;
+  if (value >= 1e9) return value * 1000;
+  return now + value * 1000;
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text.trim()) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function extractToken(text: string): string | null {

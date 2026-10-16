@@ -135,7 +135,38 @@ describe("API response shapes", () => {
       bodyKind: "json",
       topLevelKeys: ["data", "links", "meta"],
       recordCount: 2,
+      hasNextCursor: false,
     });
+
+    const cursor = "cursor-secret-9f3c";
+    const nested = new ApiSession(config(), async (url) => {
+      expect(new URL(url).searchParams.get("limit")).toBe("100");
+      return new Response(
+        JSON.stringify({
+          results: {
+            data: [{ id: 1 }, { id: 2 }, { id: 3 }],
+            next_cursor: cursor,
+            next_page_url: `https://app.subcontractorhub.com/api/v1/superadmin/orgs?cursor=${cursor}`,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    const nestedBody = healthPayload(await nested.probe());
+    expect(nestedBody).toMatchObject({
+      status: "connected",
+      topLevelKeys: ["results"],
+      recordCount: 3,
+      hasNextCursor: true,
+    });
+    expect(JSON.stringify(nestedBody)).not.toContain(cursor);
+
+    const wrapped = inspectResponse(
+      "application/json",
+      JSON.stringify({ results: { path: "/api/v1/superadmin/orgs", per_page: 1 } }),
+    );
+    expect(wrapped.summary.recordCount).toBeNull();
+    expect(wrapped.summary.hasNextCursor).toBe(false);
   });
 });
 
@@ -301,6 +332,71 @@ describe("page fallback", () => {
       expect(portfolio.mode).toBe("live");
       expect(portfolio.notice).toBeNull();
       expect(portfolio.accounts.map((account) => account.name)).toContain("Live Roofing");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("caches the crawl and groups one project list by org id", async () => {
+    process.env.SUBHUB_API_USERNAME = "cxm-service";
+    process.env.SUBHUB_API_PASSWORD = PASSWORD;
+    process.env.SUBHUB_API_KEY = "";
+    process.env.SUBHUB_AUTH_MODE = "basic";
+    process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
+    resetApiSession();
+    const urls: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("/orgs")) {
+        return Response.json({
+          results: { data: [{ id: "org_live", name: "Live Roofing", status: "launched" }], next_cursor: null },
+        });
+      }
+      if (url.includes("org_id=")) throw new Error("per-org project fetch");
+      return Response.json({
+        results: { data: [{ id: "p1", org_id: "org_live" }], next_cursor: null },
+      });
+    };
+    try {
+      const first = await readPortfolio();
+      const second = await readPortfolio();
+      expect(first.mode).toBe("live");
+      expect(second.accounts.map((account) => account.id)).toEqual(first.accounts.map((account) => account.id));
+      expect(urls.filter((url) => url.includes("/orgs"))).toHaveLength(1);
+      expect(urls.filter((url) => url.includes("/projects"))).toHaveLength(1);
+      expect(urls.some((url) => url.includes("org_id="))).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("asks each org for projects when the unfiltered list is empty", async () => {
+    process.env.SUBHUB_API_USERNAME = "cxm-service";
+    process.env.SUBHUB_API_PASSWORD = PASSWORD;
+    process.env.SUBHUB_API_KEY = "";
+    process.env.SUBHUB_AUTH_MODE = "basic";
+    process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
+    resetApiSession();
+    const urls: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("/orgs")) {
+        return Response.json({ results: { data: [{ id: "org_live", name: "Live Roofing" }] } });
+      }
+      if (url.includes("org_id=org_live")) {
+        return Response.json({ results: { data: [{ id: "p1", org_id: "org_live" }] } });
+      }
+      return Response.json({ results: { data: [] } });
+    };
+    try {
+      const portfolio = await readPortfolio();
+      expect(portfolio.mode).toBe("live");
+      expect(urls.some((url) => url.includes("/projects") && !url.includes("org_id="))).toBe(true);
+      expect(urls.some((url) => url.includes("org_id=org_live"))).toBe(true);
     } finally {
       globalThis.fetch = original;
     }

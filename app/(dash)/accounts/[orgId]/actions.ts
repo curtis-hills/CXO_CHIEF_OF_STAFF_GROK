@@ -1,7 +1,8 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
+import { revalidatePath, revalidateTag } from "next/cache";
 import { redirect } from "next/navigation";
+import { clearLiveInputsCache } from "@/lib/data/live-cache";
 import { clearOverride, writeOverride } from "@/lib/data/overrides";
 
 const ID = /^[A-Za-z0-9_-]{1,80}$/;
@@ -45,6 +46,8 @@ export async function saveLifecycleOverride(formData: FormData) {
     throw new Error("Could not store the override. This environment may be read-only until Postgres is connected.");
   }
 
+  clearLiveInputsCache();
+  revalidateTag("cxm-portfolio");
   revalidatePath("/");
   revalidatePath("/pre-launch");
   revalidatePath("/accounts");

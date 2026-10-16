@@ -37,13 +37,13 @@ Set these in `.env.local` and in the Vercel project. Do not prefix them with `NE
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `SUBHUB_API_BASE_URL` | No | Defaults to `https://app.subcontractorhub.com`. |
+| `SUBHUB_API_BASE_URL` | No | Defaults to `https://app.subcontractorhub.com`. The connected production host is `https://api.virtualsaleportal.com`. |
 | `SUBHUB_AUTH_MODE` | No | `auto` (default), `bearer`, `basic`, `basic+key`, or `login`. |
 | `SUBHUB_API_KEY` | No | Bearer token, or the key sent beside Basic auth. |
 | `SUBHUB_API_USERNAME` | No | Service-user username for Basic auth or Sanctum login. |
 | `SUBHUB_API_PASSWORD` | No | Service-user password. |
 | `SUBHUB_API_KEY_HEADER` | No | Header for the key in `basic+key`. Defaults to `X-API-Key`. |
-| `SUBHUB_LOGIN_PATH` | No | Sanctum path tried first. Blank tries `/api/login`, `/api/v1/login`, and `/api/auth/login`. |
+| `SUBHUB_LOGIN_PATH` | No | Sanctum path tried first. Blank tries `/api/auth/login`, then `/api/login`, then `/api/v1/login`. |
 | `SUBHUB_LOGIN_USERNAME_FIELD` | No | JSON field for the username. Defaults to `email`. |
 | `SUBHUB_LOGIN_PASSWORD_FIELD` | No | JSON field for the password. Defaults to `password`. |
 | `SUBHUB_LOGIN_KEY_FIELD` | No | Optional JSON field for a key. Blank omits it. |
@@ -52,11 +52,11 @@ Set these in `.env.local` and in the Vercel project. Do not prefix them with `NE
 
 `auto` uses Laravel Sanctum when `SUBHUB_API_USERNAME` and `SUBHUB_API_PASSWORD` are set. HTTP Basic is not used in auto mode: the API answers it with the HTML login page. A key alone still uses `Authorization: Bearer`. Set `SUBHUB_AUTH_MODE` to `basic` or `basic+key` only to force Basic.
 
-Login POSTs `{email, password}` (the username field defaults to `email`) and sends `Accept: application/json`. It tries `SUBHUB_LOGIN_PATH` first when that is set, then `/api/login`, `/api/v1/login`, and `/api/auth/login`, and stops at the first JSON body that contains a token (`token`, `access_token`, `data.token`, and the same names one level down). A 401 or 403 stops the search. HTML and 404 responses are recorded and the next path is tried. The token is cached in memory and sent as `Authorization: Bearer` on later calls, which also send `Accept: application/json`. A 401 on an API call refreshes the token once.
+Login POSTs `{email, password}` (the username field defaults to `email`) and sends `Accept: application/json`. It tries `SUBHUB_LOGIN_PATH` first when that is set, then `/api/auth/login`, `/api/login`, and `/api/v1/login`, and stops at the first JSON body that contains a token (`token`, `access_token`, `data.token`, and the same names one level down). A 401 or 403 stops the search. HTML and 404 responses are recorded and the next path is tried. The token is cached in memory until the `expiry` on the login JSON (`expiry` may be a timestamp, unix seconds, seconds from now, or a date). `persistent: true` without an expiry lasts 12 hours. A missing expiry lasts one hour. A 401 on an API call refreshes the token once. The token is never written to `/api/health` or the page.
 
-`GET /api/health` reports `demo`, `connected`, `auth failed`, or `unexpected body`, plus the auth mode. Login attempts are listed with path, upstream status, content type, and top-level keys. The token and the password are never included. When the orgs call answers, the JSON also includes `upstreamStatus`, `contentType`, `bodyKind`, `topLevelKeys`, `recordCount`, and a short `detail`. HTTP 200 is demo, connected, or an unexpected body you can paste back. HTTP 401 means login did not yield a usable token. HTTP 503 means the API could not be reached.
+`GET /api/health` reports `demo`, `connected`, `auth failed`, or `unexpected body`, plus the auth mode. Login attempts are listed with path, upstream status, content type, and top-level keys. The token and the password are never included. When the orgs call answers, the JSON also includes `upstreamStatus`, `contentType`, `bodyKind`, `topLevelKeys`, `recordCount`, `hasNextCursor`, and a short `detail`. `recordCount` is the number of rows in `results.data` on that page (page size 100), not the `results` object. `hasNextCursor` is true when `next_cursor` is a non-empty string. The cursor value is not included. HTTP 200 is demo, connected, or an unexpected body you can paste back. HTTP 401 means login did not yield a usable token. HTTP 503 means the API could not be reached.
 
-Org and project lists use the superadmin wrapper `results.data`, with `results.next_cursor` sent back as `?cursor=`. Flat org fields (`street`, `city`, `state`, `postal_code`, `country`) and plan names are mapped. `Sales and Referrals Monthly` is the $500 monthly plan. `Solar Per Contract Sign` is the $35 per-contract plan. Other list shapes still parse. If the body is HTML, unrecognized JSON, or any other API error, every page stays up on labeled demo data and the banner quotes the sanitized error.
+Org and project lists use the superadmin wrapper `results.data`, with `results.next_cursor` sent back as `?cursor=`. Each request uses page size 100, stops after 20 pages, and times out after 15 seconds. Projects are read in one list when each row includes an org id. Otherwise each org is requested, eight at a time. The crawl is cached in memory for 12 minutes and with Next.js `revalidate` for 15 minutes. Manual date overrides are applied after that cache, so a saved date shows up immediately. The shell renders before the crawl finishes and the page shows “Loading the portfolio…”. Flat org fields (`street`, `city`, `state`, `postal_code`, `country`) and plan names are mapped. `Sales and Referrals Monthly` is the $500 monthly plan. `Solar Per Contract Sign` is the $35 per-contract plan. Other list shapes still parse. If the body is HTML, unrecognized JSON, or any other API error, every page stays up on labeled demo data and the banner quotes the sanitized error.
 
 Credentials are read only in server modules (`lib/api/client.ts` imports `server-only`). They are not sent to the browser. Errors include the status code, content type, body kind, top-level keys, and a short sanitized snippet. Secrets and email addresses are redacted.
 
@@ -97,18 +97,18 @@ Health v1 scores volume (75) and billing (25). Through day 60, volume follows pa
 npm test
 ```
 
-Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, API auth, Sanctum login paths, `results.data` cursor pagination, plan and address mapping, sanitized API errors, and the demo fallback when the API body cannot be used.
+Unit tests cover the pace curve, status bands, the quiet-account rule, window close, pre-launch and test exclusion, business-day stage flags (including a customer wait that does not pause the clock), the health score, API auth, Sanctum login paths (with `/api/auth/login` first), token expiry, `results.data` row counts and `next_cursor`, cursor pagination, the portfolio cache, plan and address mapping, sanitized API errors, and the demo fallback when the API body cannot be used.
 
 ## Deploy on Vercel
 
 1. Import this repository. Framework preset is Next.js. Do not set a custom build command.
-2. In Project Settings → Environment Variables, set `SUBHUB_API_BASE_URL` to `https://app.subcontractorhub.com` (that is also the default).
+2. In Project Settings → Environment Variables, set `SUBHUB_API_BASE_URL` to `https://api.virtualsaleportal.com` for production. The code default remains `https://app.subcontractorhub.com`.
 3. For a live environment, set `SUBHUB_API_USERNAME` to the Executive Leadership Read Only user's email and set `SUBHUB_API_PASSWORD`. Leave `SUBHUB_AUTH_MODE` as `auto`. Leave both unset on Preview if that deployment should stay on demo data. Put secrets in the Vercel UI. Do not paste them into chat or commit them.
-4. Set `SUBHUB_LOGIN_PATH` only when you already know which Sanctum path works. Otherwise leave it blank and read `loginAttempts` from `/api/health`.
+4. Leave `SUBHUB_LOGIN_PATH` blank. The first path tried is `/api/auth/login`. Set the variable only to force a different path, and read `loginAttempts` from `/api/health`.
 5. Set `DASHBOARD_PASSWORD` on any deployment other people can open. This is a placeholder until Google SSO and a role list (admin, CX leader, support, CXM).
 6. Deploy. `npm run build` is the production build. Open `/api/health` and expect `status: "connected"`, `mode: "login"`, and a `loginPath` when the service user is set.
 
-There is no cron sync and no database in this phase. Each request reads the API, or demo data, and applies any manual dates saved on that instance.
+There is no cron sync and no database in this phase. Live org and project pages share a cached API read (about 12–15 minutes). Manual dates saved on that instance are applied on top of the cache.
 
 ## Later
 
