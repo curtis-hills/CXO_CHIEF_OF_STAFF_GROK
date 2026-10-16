@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
+import { resetApiSession } from "../lib/api/client";
+import { ENDPOINTS } from "../lib/sync/catalog";
 import { cronAuthorized } from "../lib/sync/cron";
+import { dispatchCronFollowUp, planCronFollowUp } from "../lib/sync/follow";
+import { storedCopyStatus } from "../lib/sync/progress";
+import { emptyCursor } from "../lib/sync/types";
 import {
   advanceHighWater,
   paceDelayMs,
@@ -12,17 +17,20 @@ import {
 import { normalizeOrg } from "../lib/sync/rows";
 import { resetSyncInflight, runSync } from "../lib/sync/runner";
 import { ORG_UPSERT, PROJECT_UPSERT } from "../lib/sync/postgres-store";
+import { freshCursor } from "../lib/sync/memory-store";
 import { memoryStore, resetMemoryStore } from "../lib/sync/store";
 
 afterEach(() => {
   resetMemoryStore();
   resetSyncInflight();
+  resetApiSession();
   delete process.env.SUBHUB_API_USERNAME;
   delete process.env.SUBHUB_API_PASSWORD;
   delete process.env.SUBHUB_API_KEY;
   delete process.env.SUBHUB_AUTH_MODE;
   delete process.env.SUBHUB_API_BASE_URL;
   delete process.env.CRON_SECRET;
+  delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
 });
 
 describe("sync high water and upsert", () => {
@@ -156,8 +164,186 @@ describe("sync high water and upsert", () => {
       const cursor = await memoryStore()?.getCursor("orgs");
       expect(cursor?.highWater).toBe("2026-02-01T00:00:00.000Z");
       expect(cursor?.unsupportedFilters).toContain("updated_since");
+      const runs = await memoryStore()?.listRuns(10);
+      expect(runs?.some((run) => run.endpoint === "orgs" && run.error?.includes("422") && run.error.includes("not allowed"))).toBe(true);
     } finally {
       globalThis.fetch = original;
     }
+  });
+});
+
+function authEnv(): void {
+  process.env.SUBHUB_API_USERNAME = "cxm-service";
+  process.env.SUBHUB_API_PASSWORD = "super-secret-password";
+  process.env.SUBHUB_AUTH_MODE = "basic";
+  process.env.SUBHUB_API_BASE_URL = "https://app.subcontractorhub.com";
+}
+
+describe("backfill continues after orgs", () => {
+  it("runs the next unfinished endpoint and does not restart a finished org backfill", async () => {
+    authEnv();
+    const store = memoryStore()!;
+    await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: false }));
+    const paths: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      paths.push(url.pathname);
+      if (url.pathname.endsWith("/projects")) {
+        return Response.json({
+          results: {
+            data: [{ id: "proj_1", org_id: "org_a", updated_at: "2026-03-01T00:00:00.000Z" }],
+            next_cursor: "projects-2",
+          },
+        });
+      }
+      return Response.json({ results: { data: [], next_cursor: null } });
+    };
+    try {
+      const report = await runSync({ kind: "backfill", maxPages: 1 });
+      expect(paths.some((path) => path.endsWith("/orgs"))).toBe(false);
+      expect(paths.some((path) => path.endsWith("/projects"))).toBe(true);
+      expect(report.endpoint).toBe("projects");
+      expect(report.backfillPending).toBe(true);
+      expect(store.projects.size).toBe(1);
+      const runs = await store.listRuns(5);
+      expect(runs[0]?.endpoint).toBe("projects");
+      expect(runs.some((run) => run.endpoint === "orgs")).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("lets the hourly org cron continue an unfinished backfill", async () => {
+    authEnv();
+    const store = memoryStore()!;
+    await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: true }));
+    const paths: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      paths.push(url.pathname);
+      return Response.json({
+        results: { data: [{ id: "proj_1", org_id: "org_a" }], next_cursor: "projects-2" },
+      });
+    };
+    try {
+      const report = await runSync({ kind: "orgs", maxPages: 1 });
+      expect(report.endpoint).toBe("projects");
+      expect(report.backfillPending).toBe(true);
+      expect(paths.some((path) => path.endsWith("/orgs"))).toBe(false);
+      expect(paths.some((path) => path.endsWith("/projects"))).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("records a 429 body snippet on the projects run and leaves that cursor incomplete", async () => {
+    authEnv();
+    const store = memoryStore()!;
+    await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: true }));
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (!url.pathname.endsWith("/projects")) return Response.json({ results: { data: [], next_cursor: null } });
+      return new Response(JSON.stringify({ message: "Too Many Attempts" }), {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      });
+    };
+    try {
+      const report = await runSync({ kind: "backfill", maxPages: 1 });
+      expect(report.pending).toBe(false);
+      expect(report.status).toBe("error");
+      const run = (await store.listRuns(5)).find((item) => item.endpoint === "projects");
+      expect(run?.status).toBe("error");
+      expect(run?.error).toContain("429");
+      expect(run?.error).toContain("Too Many Attempts");
+      expect((await store.getCursor("projects"))?.backfillComplete).toBeFalsy();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("records a 404 body snippet when an optional list is missing", async () => {
+    authEnv();
+    const store = memoryStore()!;
+    await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: true }));
+    await store.saveCursor("projects", freshCursor({ backfillComplete: true, passComplete: true }));
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/financials")) {
+        return new Response(JSON.stringify({ message: "The route financials could not be found." }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return Response.json({ results: { data: [], next_cursor: null } });
+    };
+    try {
+      await runSync({ kind: "backfill", maxPages: 4 });
+      const run = (await store.listRuns(10)).find((item) => item.endpoint === "financials");
+      expect(run?.status).toBe("unsupported");
+      expect(run?.error).toContain("404");
+      expect(run?.error).toContain("could not be found");
+      expect((await store.getCursor("financials"))?.disabled).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+describe("sync health and cron follow-up", () => {
+  it("reports ready only when every cursor is complete", () => {
+    const complete = { ...emptyCursor(), backfillComplete: true, passComplete: true };
+    const partial = storedCopyStatus(1804, { orgs: complete });
+    expect(partial.status).toBe("backfilling");
+    expect(partial.endpoints.orgs.state).toBe("complete");
+    expect(partial.endpoints.projects.state).toBe("in_progress");
+    expect(partial.endpoints.financials.state).toBe("in_progress");
+    const finished = Object.fromEntries(ENDPOINTS.map((endpoint) => [endpoint.id, complete]));
+    expect(storedCopyStatus(1804, finished).status).toBe("ready");
+    expect(storedCopyStatus(0, finished).status).toBe("empty");
+    const unsupported = { ...complete, disabled: true, backfillComplete: false };
+    const withGap = { ...finished, commissions: unsupported };
+    expect(storedCopyStatus(1804, withGap).status).toBe("ready");
+    expect(storedCopyStatus(1804, withGap).endpoints.commissions.state).toBe("unsupported");
+  });
+
+  it("sends the cron secret as a header and reports a blocked follow-up", async () => {
+    process.env.CRON_SECRET = "cron-secret-value";
+    process.env.VERCEL_AUTOMATION_BYPASS_SECRET = "bypass-value";
+    const plan = planCronFollowUp("https://cxm.example.com/api/cron/orgs?kind=orgs", 0, "backfill");
+    expect(plan?.url).toContain("kind=backfill");
+    expect(plan?.url).toContain("hop=1");
+    expect(plan?.url).not.toContain("cron-secret-value");
+    expect(plan?.url).not.toContain("bypass-value");
+    expect(plan?.headers.authorization).toBe("Bearer cron-secret-value");
+    expect(plan?.headers["x-vercel-protection-bypass"]).toBe("bypass-value");
+    expect(planCronFollowUp("https://cxm.example.com/api/cron/sync", 80, "backfill")).toBeNull();
+
+    const seen: Array<{ authorization: string | null; bypass: string | null }> = [];
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+    try {
+      await dispatchCronFollowUp(plan!, async (_url, init) => {
+        const headers = new Headers(init?.headers);
+        seen.push({ authorization: headers.get("authorization"), bypass: headers.get("x-vercel-protection-bypass") });
+        return new Response("<html><title>Authentication Required cron-secret-value</title></html>", {
+          status: 401,
+          headers: { "content-type": "text/html" },
+        });
+      });
+    } finally {
+      console.error = original;
+    }
+    expect(seen[0]).toEqual({ authorization: "Bearer cron-secret-value", bypass: "bypass-value" });
+    expect(errors[0]).toContain("401");
+    expect(errors.join(" ")).not.toContain("cron-secret-value");
+    expect(errors.join(" ")).not.toContain("bypass-value");
   });
 });

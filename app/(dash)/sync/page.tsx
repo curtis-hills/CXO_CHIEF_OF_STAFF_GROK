@@ -29,7 +29,7 @@ export default async function SyncPage({
       <PageHeader
         eyebrow="Sync"
         title="Stored copy of SubcontractorHub"
-        lede="Pages read this database. They do not call SubcontractorHub while rendering. The backfill walks every list at 50 rows a page and resumes from the saved cursor. The daily job runs at 09:00 UTC, about 2:00 AM Pacific during daylight time. An hourly job refreshes organizations only."
+        lede="Pages read this database. They do not call SubcontractorHub while rendering. The backfill walks every list at 50 rows a page, then the next unfinished list, and resumes from the saved cursor. The daily job runs at 09:00 UTC, about 2:00 AM Pacific during daylight time. The hourly job continues any unfinished backfill, then refreshes organizations."
       />
       <p className="mb-4 text-sm">
         Database connected: {String(setup.databaseConnected)}. Migrations applied: {String(setup.migrationsApplied)}. CRON_SECRET set:{" "}
@@ -41,7 +41,7 @@ export default async function SyncPage({
       ) : null}
       {result === "done" ? <p className="mb-4 text-sm">Backfill chunk finished.</p> : null}
       {result === "pending" ? (
-        <p className="mb-4 text-sm">Backfill is still in progress. Run it again to continue from the saved cursor.</p>
+        <p className="mb-4 text-sm">The next unfinished list is still in progress. The cron continues it from the saved cursor.</p>
       ) : null}
       {result === "error" ? <p className="mb-4 text-sm">The last chunk stopped on an error. The table below has the message.</p> : null}
       {result === "unconfigured" ? <p className="mb-4 text-sm">Connect Neon from the Vercel Storage tab, then redeploy.</p> : null}

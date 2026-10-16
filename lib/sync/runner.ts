@@ -36,6 +36,8 @@ export type SyncOptions = {
 
 export type SyncReport = {
   pending: boolean;
+  /** True when a later hop still has a list whose backfill is not Complete. */
+  backfillPending: boolean;
   rows: number;
   pages: number;
   endpoint: string | null;
@@ -68,6 +70,7 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
     if (!ready.applied) {
       return {
         pending: false,
+        backfillPending: false,
         rows: 0,
         pages: 0,
         endpoint: null,
@@ -77,18 +80,34 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
     }
   }
   const store = getStore();
-  const requested = options.endpoints ?? (options.kind === "orgs" ? (["orgs"] as EndpointId[]) : ENDPOINTS.map((endpoint) => endpoint.id));
   const now = options.now ?? new Date();
   const maxPages = options.maxPages ?? DEFAULT_PAGES;
   const budgetMs = options.budgetMs ?? DEFAULT_BUDGET_MS;
   const gapMs = options.gapMs ?? (process.env.VITEST ? 0 : 1_100);
   const started = Date.now();
+  const explicit = options.endpoints;
+  const catalogIds = ENDPOINTS.map((endpoint) => endpoint.id);
+  const watched = explicit ?? catalogIds;
   const states = new Map<EndpointId, CursorState>();
-  for (const id of requested) states.set(id, (await store.getCursor(id)) ?? emptyCursor());
+  for (const id of watched) states.set(id, (await store.getCursor(id)) ?? emptyCursor());
 
+  const backfillOpen = watched.some((id) => {
+    const state = states.get(id)!;
+    return !state.disabled && !state.backfillComplete;
+  });
   let kind: SyncKind = options.kind ?? "backfill";
-  const needsBackfill = requested.some((id) => endpointById(id).required && !states.get(id)?.backfillComplete && !states.get(id)?.disabled);
-  if (needsBackfill) kind = "backfill";
+  // The hourly org route and the daily route both land here. While any list is
+  // still unfinished, keep the backfill going instead of refreshing orgs again.
+  if (!explicit && backfillOpen) kind = "backfill";
+  const requested: EndpointId[] = explicit ? explicit : kind === "backfill" ? catalogIds : options.kind === "orgs" ? (["orgs"] as EndpointId[]) : catalogIds;
+  for (const id of requested) {
+    if (!states.has(id)) states.set(id, (await store.getCursor(id)) ?? emptyCursor());
+  }
+  const unfinished = (id: EndpointId) => {
+    const state = states.get(id)!;
+    if (state.disabled) return false;
+    return kind === "backfill" ? !state.backfillComplete : !state.passComplete;
+  };
 
   if (kind !== "backfill") {
     const active = requested.filter((id) => !states.get(id)?.disabled);
@@ -125,10 +144,7 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
   };
 
   while (pages < maxPages && Date.now() - started < budgetMs) {
-    const next = requested.find((id) => {
-      const state = states.get(id)!;
-      return !state.disabled && !state.passComplete;
-    });
+    const next = requested.find((id) => unfinished(id));
     if (!next) break;
     if (runEndpoint !== next) {
       await closeRun(status === "error" || status === "unsupported" ? status : "ok", error);
@@ -171,13 +187,16 @@ async function runSyncInner(options: SyncOptions): Promise<SyncReport> {
   const projects = states.get("projects") ?? (await store.getCursor("projects"));
   if ((await store.orgCount()) > 0 && projects?.backfillComplete) await writeSnapshots(store, now);
 
-  const pending =
-    !hardError &&
-    requested.some((id) => {
-      const state = states.get(id)!;
-      return !state.disabled && !state.passComplete;
-    });
-  return { pending, rows, pages, endpoint, status: hardError ? "error" : status, error };
+  const pending = !hardError && requested.some((id) => unfinished(id));
+  return {
+    pending,
+    backfillPending: pending && kind === "backfill",
+    rows,
+    pages,
+    endpoint,
+    status: hardError ? "error" : status,
+    error,
+  };
 }
 
 type PageOutcome = {
@@ -254,13 +273,13 @@ async function pullPage(store: SyncStore, id: EndpointId, state: CursorState, ki
       state.unsupportedFilters = [...new Set([...state.unsupportedFilters, query.filter])];
       state.lastError = syncError(error);
       await store.saveCursor(id, state);
-      return { rows: 0, countedPage: false, status: "ok", error: null, hardError: false, sleep: false, delayMs: 0 };
+      return { rows: 0, countedPage: false, status: "ok", error: state.lastError, hardError: false, sleep: false, delayMs: 0 };
     }
     if (error instanceof SubhubApiError && error.status === 422 && query.sort) {
       state.unsupportedSorts = [...new Set([...state.unsupportedSorts, query.sort])];
       state.lastError = syncError(error);
       await store.saveCursor(id, state);
-      return { rows: 0, countedPage: false, status: "ok", error: null, hardError: false, sleep: false, delayMs: 0 };
+      return { rows: 0, countedPage: false, status: "ok", error: state.lastError, hardError: false, sleep: false, delayMs: 0 };
     }
     if (error instanceof SubhubApiError && error.status === 404 && !endpoint.required) {
       state.disabled = true;
