@@ -13,20 +13,28 @@ export type LiveInputs = {
   warning: string | null;
 };
 
-let cached: { savedAt: number; value: LiveInputs } | null = null;
-let inflight: Promise<LiveInputs> | null = null;
-let holdUntil = 0;
+type CacheSlot = {
+  cached: { savedAt: number; value: LiveInputs } | null;
+  inflight: Promise<LiveInputs> | null;
+  holdUntil: number;
+};
+
+const cacheSlot: CacheSlot = ((globalThis as typeof globalThis & { __cxmLiveCache?: CacheSlot }).__cxmLiveCache ??= {
+  cached: null,
+  inflight: null,
+  holdUntil: 0,
+});
 
 export function clearLiveInputsCache(): void {
-  cached = null;
-  inflight = null;
-  holdUntil = 0;
+  cacheSlot.cached = null;
+  cacheSlot.inflight = null;
+  cacheSlot.holdUntil = 0;
 }
 
 /** Test helper. Moves the snapshot into the past and clears the refresh hold. */
 export function ageLiveInputsCache(ms: number): void {
-  if (cached) cached.savedAt -= ms;
-  holdUntil = 0;
+  if (cacheSlot.cached) cacheSlot.cached.savedAt -= ms;
+  cacheSlot.holdUntil = 0;
 }
 
 async function loadLiveInputs(): Promise<LiveInputs> {
@@ -65,31 +73,33 @@ function configuredSecrets(): string[] {
 
 export async function getLiveInputs(): Promise<LiveInputs> {
   const now = Date.now();
-  if (cached && (now - cached.savedAt < PORTFOLIO_TTL_MS || now < holdUntil)) return cached.value;
-  if (inflight) return inflight;
+  if (cacheSlot.cached && (now - cacheSlot.cached.savedAt < PORTFOLIO_TTL_MS || now < cacheSlot.holdUntil)) {
+    return cacheSlot.cached.value;
+  }
+  if (cacheSlot.inflight) return cacheSlot.inflight;
   const pending = loadFreshInputs()
     .then((value) => {
-      cached = { savedAt: Date.now(), value };
-      holdUntil = 0;
+      cacheSlot.cached = { savedAt: Date.now(), value };
+      cacheSlot.holdUntil = 0;
       return value;
     })
     .catch((error: unknown) => {
-      if (!cached) throw error;
+      if (!cacheSlot.cached) throw error;
       const notice = connectionNotice(error, configuredSecrets());
-      cached = {
-        savedAt: cached.savedAt,
+      cacheSlot.cached = {
+        savedAt: cacheSlot.cached.savedAt,
         value: {
-          ...cached.value,
+          ...cacheSlot.cached.value,
           warning: `The live API could not be refreshed. Showing the last snapshot. ${notice}`,
         },
       };
-      holdUntil = Date.now() + STALE_RETRY_MS;
+      cacheSlot.holdUntil = Date.now() + STALE_RETRY_MS;
       console.error(`CXM API refresh failed: ${notice}`);
-      return cached.value;
+      return cacheSlot.cached.value;
     })
     .finally(() => {
-      if (inflight === pending) inflight = null;
+      if (cacheSlot.inflight === pending) cacheSlot.inflight = null;
     });
-  inflight = pending;
+  cacheSlot.inflight = pending;
   return pending;
 }

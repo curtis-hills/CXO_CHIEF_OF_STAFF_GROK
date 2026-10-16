@@ -14,6 +14,7 @@ import {
   AuthRejectedError,
   connectionIntent,
   readApiAuthConfig,
+  resetProcessMemory,
   type AuthModeName,
   type ConnectionReport,
 } from "./session";
@@ -23,8 +24,12 @@ import { clearLiveInputsCache } from "../data/live-cache";
 
 export { SubhubApiError };
 
-let session: ApiSession | null = null;
-let sessionFingerprint = "";
+type SessionSlot = { session: ApiSession | null; fingerprint: string };
+
+const sessionSlot: SessionSlot = ((globalThis as typeof globalThis & { __cxmApiSession?: SessionSlot }).__cxmApiSession ??= {
+  session: null,
+  fingerprint: "",
+});
 
 function currentSession(): ApiSession {
   const config = readApiAuthConfig(process.env);
@@ -41,11 +46,11 @@ function currentSession(): ApiSession {
     config.username,
     config.password,
   ].join("\u0000");
-  if (!session || sessionFingerprint !== fingerprint) {
-    session = new ApiSession(config, fetch);
-    sessionFingerprint = fingerprint;
+  if (!sessionSlot.session || sessionSlot.fingerprint !== fingerprint) {
+    sessionSlot.session = new ApiSession(config, fetch);
+    sessionSlot.fingerprint = fingerprint;
   }
-  return session;
+  return sessionSlot.session;
 }
 
 export function getApiConfig(): { baseUrl: string; live: boolean; mode: AuthModeName | "auto" | "demo" } {
@@ -63,8 +68,9 @@ export async function checkApiConnection(): Promise<ConnectionReport> {
 }
 
 export function resetApiSession(): void {
-  session = null;
-  sessionFingerprint = "";
+  sessionSlot.session = null;
+  sessionSlot.fingerprint = "";
+  resetProcessMemory();
   clearLiveInputsCache();
 }
 

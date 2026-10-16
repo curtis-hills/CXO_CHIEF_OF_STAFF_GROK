@@ -196,6 +196,62 @@ export function basicAuthorization(username: string, password: string): string {
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+type ProcessLogin = { key: string; promise: Promise<string> };
+
+type ProcessLoginMeta = { key: string; path: string; attempts: LoginAttemptReport[] };
+
+type ProcessMemory = {
+  token: { key: string; value: string; expiresAt: number } | null;
+  login: ProcessLogin | null;
+  loginMeta: ProcessLoginMeta | null;
+  throttle: RateLimitSnapshot | null;
+  rateLimit: RateLimitSnapshot | null;
+};
+
+const EMPTY_PROCESS_MEMORY = (): ProcessMemory => ({
+  token: null,
+  login: null,
+  loginMeta: null,
+  throttle: null,
+  rateLimit: null,
+});
+
+/**
+ * Next can compile the page and /api/health into separate module copies, so a
+ * module-level session is not enough. The object lives on both globalThis and
+ * process; whichever realm the other bundle can see, it finds the same record.
+ */
+function sharedProcessMemory(): ProcessMemory {
+  const holder = globalThis as typeof globalThis & { __cxmApiMemory?: ProcessMemory };
+  const proc = process as typeof process & { __cxmApiMemory?: ProcessMemory };
+  const existing = holder.__cxmApiMemory ?? proc.__cxmApiMemory;
+  if (existing) {
+    holder.__cxmApiMemory = existing;
+    proc.__cxmApiMemory = existing;
+    return existing;
+  }
+  const created = EMPTY_PROCESS_MEMORY();
+  holder.__cxmApiMemory = created;
+  proc.__cxmApiMemory = created;
+  return created;
+}
+
+const processMemory: ProcessMemory = sharedProcessMemory();
+
+/** Drops the shared token, in-flight login, and throttle snapshot. */
+export function resetProcessMemory(): void {
+  const fresh = EMPTY_PROCESS_MEMORY();
+  processMemory.token = fresh.token;
+  processMemory.login = fresh.login;
+  processMemory.loginMeta = fresh.loginMeta;
+  processMemory.throttle = fresh.throttle;
+  processMemory.rateLimit = fresh.rateLimit;
+}
+
+function sessionKey(config: ApiAuthConfig): string {
+  return [config.baseUrl, config.mode, config.username, config.apiKey].join("\u0000");
+}
+
 export class ApiSession {
   private token: string | null = null;
   private tokenExpiresAt: number | null = null;
@@ -205,6 +261,8 @@ export class ApiSession {
   private loginPathUsed: string | null = null;
   private loginAttempts: LoginAttemptReport[] = [];
   private lastRateLimit: RateLimitSnapshot | null = null;
+  /** Kept even when a later 200 also sends X-RateLimit-* headers. */
+  private lastThrottle: RateLimitSnapshot | null = null;
 
   constructor(
     private readonly config: ApiAuthConfig,
@@ -251,7 +309,7 @@ export class ApiSession {
   }
 
   private rateLimitMeta(): { rateLimit?: RateLimitReport } {
-    const snap = this.lastRateLimit;
+    const snap = processMemory.throttle ?? this.lastThrottle ?? processMemory.rateLimit ?? this.lastRateLimit;
     if (!snap) return {};
     const rateLimit: RateLimitReport = { status: snap.status };
     if (snap.retryAfter) rateLimit.retryAfter = snap.retryAfter;
@@ -262,10 +320,16 @@ export class ApiSession {
   }
 
   private loginMeta(): { loginPath?: string; loginAttempts?: LoginAttemptReport[] } {
-    if (this.loginAttempts.length === 0) return {};
+    const shared =
+      this.loginAttempts.length === 0 && processMemory.loginMeta?.key === sessionKey(this.config)
+        ? processMemory.loginMeta
+        : null;
+    const attempts = this.loginAttempts.length > 0 ? this.loginAttempts : (shared?.attempts ?? []);
+    const path = this.loginAttempts.length > 0 ? this.loginPathUsed : (shared?.path ?? null);
+    if (attempts.length === 0) return {};
     return {
-      ...(this.loginPathUsed ? { loginPath: this.loginPathUsed } : {}),
-      loginAttempts: this.loginAttempts,
+      ...(path ? { loginPath: path } : {}),
+      loginAttempts: attempts,
     };
   }
 
@@ -321,7 +385,14 @@ export class ApiSession {
         throw new Error(redactSecrets(message, secrets));
       }
       const observed = readRateLimitHeaders(response.headers, response.status, secrets);
-      if (observed) this.lastRateLimit = observed;
+      if (observed) {
+        this.lastRateLimit = observed;
+        processMemory.rateLimit = observed;
+        if (response.status === 429) {
+          this.lastThrottle = observed;
+          processMemory.throttle = observed;
+        }
+      }
       if (response.status !== 429 || attempt === MAX_RATE_LIMIT_RETRIES) return response;
       const delay = retryDelayMs(response.headers, attempt + 1);
       await discard(response);
@@ -353,28 +424,65 @@ export class ApiSession {
     return this.tokenExpiresAt !== null && Date.now() >= this.tokenExpiresAt;
   }
 
+  private rememberToken(token: string, expiresAt: number): void {
+    this.token = token;
+    this.tokenExpiresAt = expiresAt;
+    processMemory.token = { key: sessionKey(this.config), value: token, expiresAt };
+  }
+
+  private adoptProcessToken(): void {
+    const saved = processMemory.token;
+    if (!saved || saved.key !== sessionKey(this.config)) return;
+    if (Date.now() >= saved.expiresAt) return;
+    this.token = saved.value;
+    this.tokenExpiresAt = saved.expiresAt;
+  }
+
   private async getToken(force: boolean): Promise<string> {
+    const key = sessionKey(this.config);
+    if (!force) this.adoptProcessToken();
     if (!force && this.token && !this.tokenExpired()) return this.token;
     const refresh = force || (this.token !== null && this.tokenExpired());
     if (refresh) {
       this.token = null;
       this.tokenExpiresAt = null;
+      if (processMemory.token?.key === key) processMemory.token = null;
+    }
+    const shared = !force ? processMemory.login : null;
+    if (shared?.key === key) {
+      const token = await shared.promise;
+      this.adoptProcessToken();
+      return this.token && !this.tokenExpired() ? this.token : token;
     }
     const generation = refresh ? ++this.generation : this.generation;
     if (this.inflight && this.inflightGeneration === generation) return this.inflight;
-    this.inflightGeneration = generation;
-    const pending = this.login().then((issued) => {
-      if (this.generation === generation) {
-        this.token = issued.token;
-        this.tokenExpiresAt = issued.expiresAt;
-      }
-      return issued.token;
+
+    // Publish the in-flight login before the first await. Otherwise a second
+    // session can start its own POST while this one is already inside fetch.
+    let resolveLogin: (token: string) => void = () => undefined;
+    let rejectLogin: (error: unknown) => void = () => undefined;
+    const gate = new Promise<string>((resolve, reject) => {
+      resolveLogin = resolve;
+      rejectLogin = reject;
     });
-    this.inflight = pending;
+    gate.catch(() => undefined);
+    this.inflightGeneration = generation;
+    this.inflight = gate;
+    processMemory.login = { key, promise: gate };
     try {
-      return await pending;
+      const issued = await this.login();
+      if (this.generation === generation) {
+        this.rememberToken(issued.token, issued.expiresAt);
+        processMemory.loginMeta = { key, path: this.loginPathUsed ?? "", attempts: this.loginAttempts };
+      }
+      resolveLogin(issued.token);
+      return issued.token;
+    } catch (error) {
+      rejectLogin(error);
+      throw error;
     } finally {
-      if (this.inflight === pending) this.inflight = null;
+      if (processMemory.login?.promise === gate) processMemory.login = null;
+      if (this.inflight === gate) this.inflight = null;
     }
   }
 

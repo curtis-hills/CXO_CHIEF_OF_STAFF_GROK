@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { healthPayload } from "../lib/api/health-payload";
 import {
   ApiSession,
   basicAuthorization,
   readApiAuthConfig,
   redactSecrets,
+  resetProcessMemory,
   resolveTokenExpiry,
   type ApiAuthConfig,
 } from "../lib/api/session";
@@ -34,6 +35,10 @@ function headersOf(init?: RequestInit): Headers {
 }
 
 describe("API auth", () => {
+  beforeEach(() => {
+    resetProcessMemory();
+  });
+
   it("defaults the base URL to the production app host", () => {
     expect(readApiAuthConfig({}).baseUrl).toBe("https://app.subcontractorhub.com");
     expect(readApiAuthConfig({}).mode).toBe("auto");
@@ -281,7 +286,7 @@ describe("API auth", () => {
     expect(logins).toBe(1);
 
     logins = 0;
-    const stale = new ApiSession(config({ mode: "login", loginPath: "/api/auth/login" }), async (_url, init) => {
+    const stale = new ApiSession(config({ mode: "login", loginPath: "/api/auth/login", username: "cxm-stale" }), async (_url, init) => {
       if ((init?.method ?? "GET") === "POST") {
         logins += 1;
         return json({ token: `token-${logins}`, expiry: 1_600_000_000 });
@@ -327,7 +332,10 @@ describe("API auth", () => {
           },
         });
       }
-      return json({ results: { data: [{ id: 1 }, { id: 2 }], next_cursor: null } });
+      return json({ results: { data: [{ id: 1 }, { id: 2 }], next_cursor: null } }, 200, {
+        "x-ratelimit-limit": "60",
+        "x-ratelimit-remaining": "59",
+      });
     });
     const report = await session.probe();
     const again = await session.probe();
@@ -346,6 +354,74 @@ describe("API auth", () => {
     expect(pasted.rateLimit).toEqual(report.rateLimit);
     expect(JSON.stringify(pasted)).not.toContain("cached-token-429");
     expect(JSON.stringify(pasted)).not.toContain(PASSWORD);
+  });
+
+  it("shares one in-flight login and the throttle snapshot with a later session", async () => {
+    resetProcessMemory();
+    let logins = 0;
+    let gets = 0;
+    let releaseLogin: () => void = () => undefined;
+    const loginGate = new Promise<void>((resolve) => {
+      releaseLogin = resolve;
+    });
+    const impl: (url: string, init?: RequestInit) => Promise<Response> = async (url, init) => {
+      if ((init?.method ?? "GET") === "POST") {
+        logins += 1;
+        expect(new URL(url).pathname).toBe("/api/auth/login");
+        await loginGate;
+        return json({ token: "shared-token", expiry: Math.floor(Date.now() / 1000) + 3600 });
+      }
+      gets += 1;
+      if (gets === 1) {
+        return new Response(JSON.stringify({ message: "Too Many Attempts" }), {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "0",
+            "x-ratelimit-limit": "60",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": "1700003600",
+          },
+        });
+      }
+      return json({ results: { data: [{ id: 1 }] } }, 200, {
+        "x-ratelimit-limit": "60",
+        "x-ratelimit-remaining": "59",
+      });
+    };
+    const shared = config({ mode: "login", apiKey: "", username: "shared-throttle", loginPath: "/api/auth/login" });
+    const first = new ApiSession(shared, impl);
+    const second = new ApiSession(shared, impl);
+    const both = Promise.all([first.probe(), second.probe()]);
+    await Promise.resolve();
+    releaseLogin();
+    const [left, right] = await both;
+    expect(logins).toBe(1);
+    expect(left.status).toBe("connected");
+    expect(right.status).toBe("connected");
+    expect(left.rateLimit).toEqual({
+      retryAfter: "0",
+      limit: "60",
+      remaining: "0",
+      reset: "1700003600",
+      status: 429,
+    });
+
+    let laterLogins = 0;
+    const later = new ApiSession(shared, async (_url, init) => {
+      if ((init?.method ?? "GET") === "POST") {
+        laterLogins += 1;
+        return json({ token: "should-not-login" });
+      }
+      return json({ results: { data: [{ id: 1 }] } }, 200, { "x-ratelimit-remaining": "58" });
+    });
+    const report = await later.probe();
+    expect(laterLogins).toBe(0);
+    expect(report.rateLimit?.status).toBe(429);
+    expect(report.rateLimit?.remaining).toBe("0");
+    expect(report.loginPath).toBe("/api/auth/login");
+    expect(JSON.stringify(report)).not.toContain("shared-token");
+    expect(JSON.stringify(report)).not.toContain("should-not-login");
   });
 
   it("rejects header injection in credentials", () => {
@@ -369,9 +445,9 @@ describe("API auth", () => {
   });
 });
 
-function json(body: unknown, status = 200): Response {
+function json(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extra },
   });
 }
