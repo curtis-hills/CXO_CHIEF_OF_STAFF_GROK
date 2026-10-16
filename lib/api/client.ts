@@ -17,7 +17,7 @@ import {
   type AuthModeName,
   type ConnectionReport,
 } from "./session";
-import { PAGE_SIZE, PROJECT_FETCH_CONCURRENCY } from "./limits";
+import { PAGE_SIZE } from "./limits";
 import type { ApiOrg, ApiProject } from "./types";
 import { clearLiveInputsCache } from "../data/live-cache";
 
@@ -112,21 +112,6 @@ export async function fetchAllPages<T>(
   }
 }
 
-async function mapPool<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await fn(items[index]!, index);
-    }
-  }
-  const workers = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workers }, () => worker()));
-  return results;
-}
-
 export async function fetchOrgs(): Promise<ApiOrg[]> {
   return fetchAllPages<ApiOrg>("/api/v1/superadmin/orgs");
 }
@@ -145,12 +130,13 @@ export async function fetchProjectsByOrg(orgIds: string[]): Promise<Record<strin
   return fetchProjectsPerOrg(orgIds);
 }
 
+/** One org at a time. A parallel fan-out trips the Laravel throttle. */
 async function fetchProjectsPerOrg(orgIds: string[]): Promise<Record<string, ApiProject[]>> {
-  const rows = await mapPool(orgIds, PROJECT_FETCH_CONCURRENCY, async (orgId) => {
-    const projects = await fetchAllPages<ApiProject>("/api/v1/superadmin/projects", { org_id: orgId });
-    return [orgId, projects] as const;
-  });
-  return Object.fromEntries(rows);
+  const grouped: Record<string, ApiProject[]> = {};
+  for (const orgId of orgIds) {
+    grouped[orgId] = await fetchAllPages<ApiProject>("/api/v1/superadmin/projects", { org_id: orgId });
+  }
+  return grouped;
 }
 
 function groupProjects(orgIds: string[], projects: ApiProject[]): Record<string, ApiProject[]> | null {
@@ -179,7 +165,7 @@ function projectOrgId(project: ApiProject): string | null {
 
 function shouldFetchProjectsPerOrg(error: unknown): boolean {
   if (!(error instanceof SubhubApiError)) return false;
-  if (error.status === 401 || error.status === 403) return false;
+  if (error.status === 401 || error.status === 403 || error.status === 429) return false;
   if (error.bodyKind === "html") return false;
   return true;
 }

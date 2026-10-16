@@ -305,6 +305,49 @@ describe("API auth", () => {
     expect(resolveTokenExpiry({ token: "abc" }, now)).toBe(now + 60 * 60 * 1000);
   });
 
+  it("retries a 429 using the rate-limit headers and keeps the cached token", async () => {
+    let logins = 0;
+    let gets = 0;
+    const session = new ApiSession(config({ mode: "login", apiKey: "", loginPath: "/api/auth/login" }), async (url, init) => {
+      if ((init?.method ?? "GET") === "POST") {
+        logins += 1;
+        expect(new URL(url).pathname).toBe("/api/auth/login");
+        return json({ token: "cached-token-429", expiry: Math.floor(Date.now() / 1000) + 3600 });
+      }
+      gets += 1;
+      if (gets === 1) {
+        return new Response(JSON.stringify({ message: "Too Many Attempts" }), {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "0",
+            "x-ratelimit-limit": "60",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": "1700003600",
+          },
+        });
+      }
+      return json({ results: { data: [{ id: 1 }, { id: 2 }], next_cursor: null } });
+    });
+    const report = await session.probe();
+    const again = await session.probe();
+    expect(report.status).toBe("connected");
+    expect(again.status).toBe("connected");
+    expect(logins).toBe(1);
+    expect(gets).toBe(3);
+    expect(report.rateLimit).toEqual({
+      retryAfter: "0",
+      limit: "60",
+      remaining: "0",
+      reset: "1700003600",
+      status: 429,
+    });
+    const pasted = healthPayload(report);
+    expect(pasted.rateLimit).toEqual(report.rateLimit);
+    expect(JSON.stringify(pasted)).not.toContain("cached-token-429");
+    expect(JSON.stringify(pasted)).not.toContain(PASSWORD);
+  });
+
   it("rejects header injection in credentials", () => {
     expect(() => basicAuthorization("ada\r\nX-Injected: 1", PASSWORD)).toThrow(/not valid/);
   });

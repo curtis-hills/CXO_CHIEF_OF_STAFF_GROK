@@ -1,10 +1,10 @@
 import { loadPortfolio } from "@/lib/data/load";
-import { formatUtcWeekday } from "@/lib/metrics/calendar";
+import { formatUtcTimestamp, formatUtcWeekday } from "@/lib/metrics/calendar";
 import { SideNav } from "./side-nav";
 
 export async function ConnectionBanner() {
   const portfolio = await loadPortfolio();
-  if (portfolio.notice) {
+  if (portfolio.mode === "mock" && portfolio.notice) {
     return (
       <p>
         <span className="font-semibold">Demo data.</span> The live API could not be read, so this is a labeled stand-in.{" "}
@@ -17,6 +17,13 @@ export async function ConnectionBanner() {
       <p>
         <span className="font-semibold">Demo data.</span> API credentials are not set, so this is a labeled stand-in
         portfolio. Lifecycle dates are proxies until engineering ships them.
+      </p>
+    );
+  }
+  if (portfolio.notice) {
+    return (
+      <p>
+        <span className="font-semibold">Warning.</span> <span className="break-words">{portfolio.notice}</span>
       </p>
     );
   }
@@ -35,5 +42,10 @@ export async function AlertNav() {
 
 export async function AsOfLine() {
   const portfolio = await loadPortfolio();
-  return <p className="mb-4 text-xs text-muted">{formatUtcWeekday(portfolio.asOf)} · UTC</p>;
+  return (
+    <p className="mb-4 text-xs text-muted">
+      {formatUtcWeekday(portfolio.asOf)} · UTC
+      {portfolio.dataAsOf ? ` · Data as of ${formatUtcTimestamp(portfolio.dataAsOf)}` : ""}
+    </p>
+  );
 }
