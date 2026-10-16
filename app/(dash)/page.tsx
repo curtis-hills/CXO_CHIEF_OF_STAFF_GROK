@@ -3,6 +3,7 @@ import { PaceChip, Panel, SlaChip, Stat } from "@/components/ui";
 import { TRANSACTION_FEE_USD, accountTypeLabel } from "@/lib/domain";
 import { loadPortfolio } from "@/lib/data/load";
 import { cohortAccounts, liveProjectsOnDay, median, prelaunchAccounts } from "@/lib/data/views";
+import { flaggedClock } from "@/lib/metrics/stage";
 import { formatNumber, formatUsd } from "@/lib/format";
 
 export const metadata = { title: "Daily brief" };
@@ -163,19 +164,20 @@ export default async function OverviewPage() {
         >
           <ul className="divide-y divide-line">
             {breaches.length === 0 ? <li className="text-sm text-muted">None.</li> : null}
-            {breaches.map((account) => (
-              <li key={account.id} className="flex items-center justify-between gap-3 py-2">
-                <div>
-                  <Link href={`/accounts/${account.id}`} className="text-sm font-medium hover:underline">
-                    {account.name}
-                  </Link>
-                  <p className="text-xs text-muted">{accountTypeLabel(account.accountType, account.legacySeamlessDealer)}</p>
-                </div>
-                <SlaChip tone={account.stageTiming.inStageTone ?? account.stageTiming.onboardingToLaunched.tone}>
-                  {account.stageTiming.businessDaysInStage ?? account.stageTiming.onboardingToLaunched.businessDays} bd
-                </SlaChip>
-              </li>
-            ))}
+            {breaches.map((account) => {
+              const flagged = flaggedClock(account.stageTiming);
+              return (
+                <li key={account.id} className="flex items-center justify-between gap-3 py-2">
+                  <div>
+                    <Link href={`/accounts/${account.id}`} className="text-sm font-medium hover:underline">
+                      {account.name}
+                    </Link>
+                    <p className="text-xs text-muted">{accountTypeLabel(account.accountType, account.legacySeamlessDealer)}</p>
+                  </div>
+                  {flagged ? <SlaChip tone={flagged.tone}>{flagged.businessDays} bd</SlaChip> : null}
+                </li>
+              );
+            })}
           </ul>
         </Panel>
         <Panel

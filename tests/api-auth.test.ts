@@ -59,7 +59,7 @@ describe("API auth", () => {
     });
     expect(headersOf(calls[0]?.init).get("authorization")).toBe(`Bearer ${API_KEY}`);
     expect(calls[0]?.url).toContain("https://app.subcontractorhub.com/api/v1/superadmin/orgs");
-    expect(new URL(calls[0]?.url ?? "").searchParams.get("limit")).toBe("100");
+    expect(new URL(calls[0]?.url ?? "").searchParams.get("limit")).toBe("50");
     expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
   });
 

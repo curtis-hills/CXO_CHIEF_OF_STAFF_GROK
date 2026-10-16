@@ -5,6 +5,7 @@ import {
   inspectResponse,
   SubhubApiError,
 } from "../lib/api/body";
+import { MAX_PAGES, PAGE_SIZE } from "../lib/api/limits";
 import { healthPayload } from "../lib/api/health-payload";
 import { fetchOrgs, resetApiSession } from "../lib/api/client";
 import { ApiSession, type ApiAuthConfig } from "../lib/api/session";
@@ -67,6 +68,32 @@ describe("API response shapes", () => {
     });
     expect(items.map((item) => item.id)).toEqual(["a", "b"]);
     expect(seen).toEqual([undefined, 2]);
+  });
+
+  it("uses limit 50 and follows next_cursor through 2000 rows, then stops at the page cap", async () => {
+    expect(PAGE_SIZE).toBe(50);
+    expect(PAGE_SIZE).toBeLessThanOrEqual(50);
+    expect(MAX_PAGES).toBeGreaterThanOrEqual(40);
+    expect(PAGE_SIZE * MAX_PAGES).toBeGreaterThanOrEqual(2000);
+
+    const cursors: Array<string | undefined> = [];
+    const items = await collectAll<{ id: number }>(async (query) => {
+      cursors.push(query.cursor);
+      const index = query.cursor ? Number(query.cursor) : 0;
+      const start = index * PAGE_SIZE;
+      const nextIndex = index + 1;
+      return {
+        results: {
+          data: Array.from({ length: PAGE_SIZE }, (_, offset) => ({ id: start + offset })),
+          next_cursor: nextIndex < MAX_PAGES + 5 ? String(nextIndex) : null,
+        },
+      };
+    });
+    expect(cursors).toHaveLength(MAX_PAGES);
+    expect(cursors[0]).toBeUndefined();
+    expect(cursors[MAX_PAGES - 1]).toBe(String(MAX_PAGES - 1));
+    expect(items).toHaveLength(PAGE_SIZE * MAX_PAGES);
+    expect(items.length).toBeGreaterThanOrEqual(2000);
   });
 
   it("describes an HTML 200 without credentials or email addresses", () => {
@@ -140,7 +167,7 @@ describe("API response shapes", () => {
 
     const cursor = "cursor-secret-9f3c";
     const nested = new ApiSession(config(), async (url) => {
-      expect(new URL(url).searchParams.get("limit")).toBe("100");
+      expect(new URL(url).searchParams.get("limit")).toBe("50");
       return new Response(
         JSON.stringify({
           results: {
