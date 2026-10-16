@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-serif: "Iowan Old Style", Palatino, Georgia, serif;
+  --color-ink: #1c2430;
+  --color-paper: #f3f0e8;
+  --color-card: #fffcf8;
+  --color-line: #e4ddd0;
+  --color-tide: #0f5c56;
+  --color-navy: #1b3048;
+  --color-muted: #6b645b;
+}
+
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+table.data th {
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid var(--color-line);
+  color: var(--color-muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+table.data td {
+  padding: 0.7rem 0.75rem;
+  border-bottom: 1px solid var(--color-line);
+  vertical-align: middle;
+}
+
+table.data tbody tr:hover td {
+  background: #faf7f1;
+}
+
+.field {
+  border: 1px solid var(--color-line);
+  background: white;
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.55rem;
+  font-size: 0.875rem;
+}
+
+.field:focus {
+  outline: 2px solid var(--color-tide);
+  outline-offset: 1px;
+}
