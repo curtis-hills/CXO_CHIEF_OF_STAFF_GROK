@@ -26,17 +26,28 @@ function asStringList(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
-function cursorFrom(row: Record<string, unknown>): CursorState {
+function integerOf(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value)) return Number(value);
+  return null;
+}
+
+function boolOf(value: unknown): boolean {
+  return value === true || value === "t" || value === "true" || value === 1 || value === "1";
+}
+
+/** Neon sometimes returns integers and booleans as strings. A missed page number restarts the list. */
+export function cursorStateFromRow(row: Record<string, unknown>): CursorState {
   return {
     cursor: typeof row.cursor === "string" ? row.cursor : null,
-    page: typeof row.page === "number" ? row.page : null,
+    page: integerOf(row.page),
     highWater: iso(row.high_water),
-    passComplete: row.pass_complete === true,
-    backfillComplete: row.backfill_complete === true,
-    disabled: row.disabled === true,
+    passComplete: boolOf(row.pass_complete),
+    backfillComplete: boolOf(row.backfill_complete),
+    disabled: boolOf(row.disabled),
     strategy: row.strategy === "per-org" ? "per-org" : "platform",
-    orgIndex: typeof row.org_index === "number" ? row.org_index : 0,
-    fullPass: row.full_pass === true,
+    orgIndex: integerOf(row.org_index) ?? 0,
+    fullPass: boolOf(row.full_pass),
     lastReconcileDay: day(row.last_reconcile_day),
     unsupportedFilters: asStringList(row.unsupported_filters),
     unsupportedSorts: asStringList(row.unsupported_sorts),
@@ -187,7 +198,7 @@ export class PostgresStore implements SyncStore {
   async getCursor(endpoint: EndpointId): Promise<CursorState | null> {
     const rows = await getSql().query(`SELECT * FROM sync_cursors WHERE endpoint = $1`, [endpoint]);
     const row = rows[0] as Record<string, unknown> | undefined;
-    return row ? cursorFrom(row) : null;
+    return row ? cursorStateFromRow(row) : null;
   }
 
   async saveCursor(endpoint: EndpointId, state: CursorState): Promise<void> {
@@ -270,7 +281,21 @@ export class PostgresStore implements SyncStore {
   }
 
   async orgCount(): Promise<number> {
-    const rows = await getSql().query(`SELECT count(*)::int AS count FROM orgs`);
+    return this.rowCount("orgs");
+  }
+
+  async rowCount(endpoint: EndpointId): Promise<number> {
+    const table =
+      endpoint === "orgs"
+        ? "orgs"
+        : endpoint === "projects"
+          ? "projects"
+          : endpoint === "financials"
+            ? "financials"
+            : endpoint === "esign_status"
+              ? "esign_status"
+              : "commissions";
+    const rows = await getSql().query(`SELECT count(*)::int AS count FROM ${table}`);
     return Number((rows[0] as { count?: number } | undefined)?.count ?? 0);
   }
 

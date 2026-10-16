@@ -75,6 +75,14 @@ export class MemoryStore implements SyncStore {
     return this.orgs.size;
   }
 
+  async rowCount(endpoint: EndpointId): Promise<number> {
+    if (endpoint === "orgs") return this.orgs.size;
+    if (endpoint === "projects") return this.projects.size;
+    if (endpoint === "financials") return this.financials.size;
+    if (endpoint === "esign_status") return this.esign.size;
+    return this.commissions.size;
+  }
+
   async listOrgIds(): Promise<string[]> {
     return [...this.orgs.keys()];
   }

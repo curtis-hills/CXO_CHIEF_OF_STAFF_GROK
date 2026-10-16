@@ -2,6 +2,7 @@ import { PageHeader } from "@/components/ui";
 import { readSetupStatus } from "@/lib/db/migrate";
 import { formatUtcTimestamp } from "@/lib/metrics/calendar";
 import { ENDPOINTS } from "@/lib/sync/catalog";
+import { backfillLabel } from "@/lib/sync/progress";
 import { getStore } from "@/lib/sync/store";
 import type { CursorState, SyncRunRow, SyncStore } from "@/lib/sync/types";
 import { runBackfillNow, setupDatabase } from "./actions";
@@ -69,24 +70,26 @@ export default async function SyncPage({
             <tr>
               <th>Endpoint</th>
               <th>Backfill</th>
-              <th>High water</th>
+              <th>Newest updated</th>
               <th>Resume</th>
               <th>Unsupported filters</th>
+              <th>Error</th>
             </tr>
           </thead>
           <tbody>
             {cursors.map((cursor) => (
               <tr key={cursor.id}>
                 <td>{cursor.id}</td>
-                <td>{cursor.state?.disabled ? "Unsupported" : cursor.state?.backfillComplete ? "Complete" : "In progress"}</td>
+                <td>{backfillLabel(cursor.state)}</td>
                 <td className="text-xs">{cursor.state?.highWater ? formatUtcTimestamp(cursor.state.highWater) : "—"}</td>
                 <td className="text-xs">{cursor.state?.cursor || cursor.state?.page ? "Saved" : "—"}</td>
                 <td className="text-xs text-muted">{cursor.state?.unsupportedFilters.join(", ") || "—"}</td>
+                <td className="max-w-sm text-xs text-muted">{cursor.state?.lastError ?? "—"}</td>
               </tr>
             ))}
             {cursors.length === 0 ? (
               <tr>
-                <td colSpan={5} className="text-sm text-muted">
+                <td colSpan={6} className="text-sm text-muted">
                   No cursors yet.
                 </td>
               </tr>
