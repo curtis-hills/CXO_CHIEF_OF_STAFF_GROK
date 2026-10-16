@@ -1,4 +1,5 @@
 import type { ApiOrg, ApiProject } from "../api/types";
+import { projectsByOrg } from "../data/project-orgs";
 import type { EndpointId } from "./catalog";
 import { upsertById } from "./high-water";
 import type { GenericRow, OrgRow, ProjectRow, SubscriptionRow } from "./rows";
@@ -83,13 +84,23 @@ export class MemoryStore implements SyncStore {
   }
 
   async loadProjectsByOrg(): Promise<Record<string, ApiProject[]>> {
-    const grouped: Record<string, ApiProject[]> = {};
-    for (const row of this.projects.values()) {
-      if (!row.orgId) continue;
-      grouped[row.orgId] ??= [];
-      grouped[row.orgId].push(row.raw);
-    }
-    return grouped;
+    const child = (row: GenericRow) => ({ orgId: row.orgId, projectId: row.projectId, raw: row.raw });
+    return projectsByOrg({
+      orgIds: this.orgs.keys(),
+      projects: [...this.projects.values()].map((row) => ({
+        id: row.id,
+        orgId: row.orgId,
+        raw: row.raw,
+        createdAt: row.createdAt,
+        deletedAt: row.deletedAt,
+        isTest: row.isTest,
+        jobType: row.jobType,
+        systemSize: row.systemSize,
+      })),
+      commissions: [...this.commissions.values()].map(child),
+      esign: [...this.esign.values()].map(child),
+      financials: [...this.financials.values()].map(child),
+    }).projectsByOrg;
   }
 
   async projectRowCount(): Promise<number> {

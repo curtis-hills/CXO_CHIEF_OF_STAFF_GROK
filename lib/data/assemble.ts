@@ -130,7 +130,24 @@ function toAccount(
     proxy?.readyToLaunchAt,
     "Ready to Launch date",
   );
-  const launchedAt = resolveDate(org.launched_at, manual?.launchedAt, proxy?.launchedAt, "Launched date");
+  const orgProjects = input.projectsByOrg[id] ?? [];
+  let launchedAt = resolveDate(org.launched_at, manual?.launchedAt, proxy?.launchedAt, "Launched date");
+  let launchDateUnknown = false;
+  if (!org.launched_at && !manual?.launchedAt && !proxy?.launchedAt && stage === "launched" && input.mode === "live") {
+    launchDateUnknown = true;
+    const earliest = earliestInstant(orgProjects.map((project) => project.created_at));
+    launchedAt = earliest
+      ? {
+          iso: earliest,
+          source: "proxy",
+          note: "Launch date unknown. The earliest stored project date is a proxy until engineering ships launched_at (P0-1).",
+        }
+      : {
+          iso: null,
+          source: "missing",
+          note: "Launch date unknown. No project date is stored yet to use as a proxy (P0-1).",
+        };
+  }
 
   const apiType = accountTypeFromApi(org.account_type, org.legacy_seamless_dealer);
   let accountType: AccountType;
@@ -189,7 +206,7 @@ function toAccount(
   const launchDay = launchedAt.iso ? utcDayNumber(launchedAt.iso) : null;
   const asOfDay = utcDayNumber(input.asOf);
   const projects: ProjectView[] = projectsAvailable
-    ? (input.projectsByOrg[id] ?? []).map((project) => {
+    ? orgProjects.map((project) => {
     const createdAt = project.created_at ?? input.asOf;
     const isTest = project.is_test === true;
     const deleted = Boolean(project.deleted_at);
@@ -240,7 +257,11 @@ function toAccount(
   const health = !projectsAvailable
     ? unscoredHealth("Projects could not be loaded, so pace and health are not scored from volume.")
     : stage === "launched" && !launchedAt.iso
-      ? unscoredHealth("Launched date is missing, so pace and health are not scored.")
+      ? unscoredHealth(
+          launchDateUnknown
+            ? "Launch date unknown, and no project date is available as a proxy, so pace and health are not scored (P0-1)."
+            : "Launched date is missing, so pace and health are not scored.",
+        )
       : evaluateHealth({
           launched: stage === "launched",
           paceStatus: pace?.status ?? null,
@@ -302,6 +323,7 @@ function toAccount(
     onboardingAt,
     readyToLaunchAt,
     launchedAt,
+    launchDateUnknown,
     waitingOnCustomer,
     waitingReason,
     waitingSource,
@@ -314,6 +336,17 @@ function toAccount(
     health,
     dailyCounts,
   };
+}
+
+function earliestInstant(values: Array<string | null | undefined>): string | null {
+  let best: { iso: string; ms: number } | null = null;
+  for (const value of values) {
+    if (!value) continue;
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms)) continue;
+    if (!best || ms < best.ms) best = { iso: value, ms };
+  }
+  return best?.iso ?? null;
 }
 
 function blankStage(timing: Account["stageTiming"]): Account["stageTiming"] {

@@ -1,16 +1,19 @@
 import Link from "next/link";
 import { PaceChip, Panel, SlaChip, Stat } from "@/components/ui";
 import { TRANSACTION_FEE_USD, accountTypeLabel } from "@/lib/domain";
+import { visibleBook } from "@/lib/data/filters";
 import { loadPortfolio } from "@/lib/data/load";
 import { cohortAccounts, liveProjectsOnDay, median, prelaunchAccounts } from "@/lib/data/views";
 import { flaggedClock } from "@/lib/metrics/stage";
+import { formatUtcTimestamp } from "@/lib/metrics/calendar";
 import { formatNumber, formatUsd } from "@/lib/format";
 
 export const metadata = { title: "Daily brief" };
 
 export default async function OverviewPage() {
   const portfolio = await loadPortfolio();
-  const { accounts, alerts, asOf } = portfolio;
+  const { accounts, alerts } = visibleBook(portfolio);
+  const { asOf } = portfolio;
   const prelaunch = prelaunchAccounts(accounts);
   const cohort = cohortAccounts(accounts);
   const active = cohort.filter((account) => account.pace && account.pace.day <= 60 && account.pace.status !== "ramping");
@@ -139,15 +142,24 @@ export default async function OverviewPage() {
           <Panel title="Data">
             <ul className="space-y-2 text-sm leading-5">
               <li>
-                {portfolio.notice
-                  ? "Showing demo data because the live API could not be read."
-                  : portfolio.mode === "mock"
-                    ? "Reading demo data."
-                    : "Reading the Executive API."}
+                {portfolio.mode === "live"
+                  ? `Reading the stored copy${portfolio.dataAsOf ? `. Data as of ${formatUtcTimestamp(portfolio.dataAsOf)}` : ""}.`
+                  : portfolio.notice ?? "Reading demo data."}
               </li>
-              <li>{proxyDates} lifecycle dates are proxies. {missingLaunch.length} launched {missingLaunch.length === 1 ? "account has" : "accounts have"} no day 0.</li>
+              <li>
+                {portfolio.mode === "live"
+                  ? portfolio.projectsAvailable
+                    ? "Projects are read from the stored copy. "
+                    : "Projects are still backfilling, so pace counts stay incomplete. "
+                  : null}
+                {proxyDates} lifecycle dates are proxies. {missingLaunch.length} launched {missingLaunch.length === 1 ? "account has" : "accounts have"} no day 0.
+              </li>
               <li>{handoffs.length} new handoffs in the last 7 days. {red.length} accounts are red on v1 health.</li>
-              <li>No snapshot database yet. The later Postgres shapes live in the data schema file.</li>
+              <li>
+                {portfolio.mode === "live"
+                  ? "This brief keeps Won, Onboarding, Launched, and Retention, and leaves test and demo orgs out."
+                  : "Demo lifecycle dates are proxies until engineering ships them."}
+              </li>
             </ul>
           </Panel>
         </div>

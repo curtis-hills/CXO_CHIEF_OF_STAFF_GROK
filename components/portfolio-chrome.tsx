@@ -1,37 +1,23 @@
+import { connectionMessage } from "@/lib/data/connection-message";
+import { alertsForAccounts, applyPortfolioFilter, readPortfolioFilter } from "@/lib/data/filters";
 import { loadPortfolio } from "@/lib/data/load";
 import { formatUtcTimestamp, formatUtcWeekday } from "@/lib/metrics/calendar";
 import { SideNav } from "./side-nav";
 
 export async function ConnectionBanner() {
   const portfolio = await loadPortfolio();
-  if (portfolio.mode === "mock") {
-    return (
-      <p>
-        <span className="font-semibold">Demo data.</span>{" "}
-        <span className="break-words">
-          {portfolio.notice ?? "The database is empty, so this is a labeled stand-in."}
-        </span>
-      </p>
-    );
-  }
-  if (portfolio.notice) {
-    return (
-      <p>
-        <span className="font-semibold">Warning.</span> <span className="break-words">{portfolio.notice}</span>
-      </p>
-    );
-  }
+  const message = connectionMessage(portfolio);
   return (
     <p>
-      <span className="font-semibold">Stored copy.</span> Pages read the last sync, not the live SubcontractorHub API.
-      Dates the API does not return yet stay blank unless someone saved a manual stand-in.
+      <span className="font-semibold">{message.title}</span> <span className="break-words">{message.body}</span>
     </p>
   );
 }
 
 export async function AlertNav() {
   const portfolio = await loadPortfolio();
-  return <SideNav alertCount={portfolio.alerts.length} />;
+  const accounts = applyPortfolioFilter(portfolio.accounts, readPortfolioFilter({}, portfolio.mode));
+  return <SideNav alertCount={alertsForAccounts(portfolio.alerts, accounts).length} />;
 }
 
 export async function AsOfLine() {

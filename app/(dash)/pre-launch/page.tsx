@@ -1,6 +1,8 @@
 import Link from "next/link";
-import { Chip, PageHeader, SlaChip, SourceBadge } from "@/components/ui";
+import { OrgBreakdown, OrgFilterFields, filterNote } from "@/components/org-filter";
+import { Chip, PageHeader, PaymentChip, SlaChip, SourceBadge } from "@/components/ui";
 import { accountTypeLabel, requiredCompletion, type Account } from "@/lib/domain";
+import { visibleBook } from "@/lib/data/filters";
 import { loadPortfolio } from "@/lib/data/load";
 import { one } from "@/lib/format";
 
@@ -18,17 +20,15 @@ export default async function PrelaunchPage({
 }) {
   const query = await searchParams;
   const portfolio = await loadPortfolio();
+  const { filter, accounts } = visibleBook(portfolio, query);
   const type = one(query.type);
-  const cxm = one(query.cxm);
   const from = one(query.from);
   const to = one(query.to);
-  const cxms = uniqueCxms(portfolio.accounts);
 
   const lanes = LANES.map((lane) => {
-    const cards = portfolio.accounts
+    const cards = accounts
       .filter((account) => account.stage === lane.id)
       .filter((account) => matchesType(account, type))
-      .filter((account) => !cxm || account.cxm?.name === cxm || (cxm === "unassigned" && !account.cxm))
       .filter((account) => {
         if (!from && !to) return true;
         const day = account.onboardingAt.iso?.slice(0, 10);
@@ -48,7 +48,8 @@ export default async function PrelaunchPage({
         title="Onboarding and Ready to Launch"
         lede="CX Admin does the setup. The CXM verifies it and is the person who later sets Launched. Time in stage is business days. Green is at or under the goal, amber through the flag, red after it. Waiting on the customer is flagged, and the clock still runs."
       />
-      <form className="mb-5 flex flex-wrap items-end gap-3" method="get">
+      <form key={JSON.stringify(query)} className="mb-3 flex flex-wrap items-end gap-3" method="get">
+        <OrgFilterFields filter={filter} accounts={portfolio.accounts} />
         <label className="text-xs text-muted">
           Account type
           <select name="type" defaultValue={type} className="field mt-1 block">
@@ -60,16 +61,6 @@ export default async function PrelaunchPage({
           </select>
         </label>
         <label className="text-xs text-muted">
-          CXM
-          <select name="cxm" defaultValue={cxm} className="field mt-1 block">
-            <option value="">All</option>
-            <option value="unassigned">Unassigned</option>
-            {cxms.map((name) => (
-              <option key={name}>{name}</option>
-            ))}
-          </select>
-        </label>
-        <label className="text-xs text-muted">
           Onboarding from
           <input name="from" type="date" defaultValue={from} className="field mt-1 block" />
         </label>
@@ -78,9 +69,16 @@ export default async function PrelaunchPage({
           <input name="to" type="date" defaultValue={to} className="field mt-1 block" />
         </label>
         <button type="submit" className="rounded-md bg-navy px-3 py-2 text-sm text-white">
-          Filter
+          Apply
         </button>
       </form>
+      <p className="mb-4 max-w-3xl text-xs leading-5 text-muted">{filterNote(portfolio.mode)}</p>
+      <OrgBreakdown
+        accounts={accounts}
+        highlightStatuses={filter.statuses}
+        sliceLabel="in the pre-launch lanes"
+        sliceCount={lanes.reduce((sum, lane) => sum + lane.cards.length, 0)}
+      />
       <div className="grid gap-4 lg:grid-cols-2">
         {lanes.map((lane) => (
           <section key={lane.id}>
@@ -127,7 +125,10 @@ function LaneCard({ account }: { account: Account }) {
       <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
         <div>
           <dt className="text-muted">CXM</dt>
-          <dd>{account.cxm?.name ?? "Unassigned"}</dd>
+          <dd className="flex flex-wrap items-center gap-2">
+            <span>{account.cxm?.name ?? "Unassigned"}</span>
+            <PaymentChip status={account.paymentStatus} />
+          </dd>
         </div>
         <div>
           <dt className="text-muted">Checklist</dt>
@@ -162,8 +163,4 @@ function matchesType(account: Account, type: string): boolean {
   if (type === "seamless_dealer") return account.legacySeamlessDealer;
   if (type === "sales_org") return account.accountType === "sales_org" && !account.legacySeamlessDealer;
   return account.accountType === type;
-}
-
-function uniqueCxms(accounts: Account[]): string[] {
-  return [...new Set(accounts.map((account) => account.cxm?.name).filter((name): name is string => Boolean(name)))].sort();
 }

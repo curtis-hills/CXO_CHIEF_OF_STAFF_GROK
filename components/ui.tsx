@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { isPaymentFlagged } from "@/lib/data/filters";
 import type { DateSource } from "@/lib/domain";
 import type { HealthBand } from "@/lib/metrics/health";
 import type { PaceStatus } from "@/lib/metrics/pace";
@@ -111,6 +112,22 @@ const sourceCopy: Record<DateSource, { label: string; tone: keyof typeof chipCla
 export function SourceBadge({ source }: { source: DateSource }) {
   const item = sourceCopy[source];
   return <Chip tone={item.tone}>{item.label}</Chip>;
+}
+
+export function PaymentChip({ status }: { status: string }) {
+  if (!isPaymentFlagged(status)) return null;
+  const label = status.toLowerCase() === "canceled" ? "cancelled" : status.toLowerCase();
+  return <Chip tone="bad">Payment {label}</Chip>;
+}
+
+export function LaunchDateLabel({ unknown, source }: { unknown: boolean; source: DateSource }) {
+  if (!unknown) return <SourceBadge source={source} />;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      <span className="text-xs font-medium text-amber-950">Launch date unknown</span>
+      <SourceBadge source={source} />
+    </span>
+  );
 }
 
 export function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {

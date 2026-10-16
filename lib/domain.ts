@@ -81,6 +81,8 @@ export type Account = {
   onboardingAt: ResolvedDate;
   readyToLaunchAt: ResolvedDate;
   launchedAt: ResolvedDate;
+  /** Launched, with no API or manual date. Pace may use the earliest project as a proxy. */
+  launchDateUnknown: boolean;
   waitingOnCustomer: boolean;
   waitingReason: string | null;
   waitingSource: DateSource;
