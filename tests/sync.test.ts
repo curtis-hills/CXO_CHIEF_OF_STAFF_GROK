@@ -8,12 +8,14 @@ import { backfillLabel, storedCopyStatus } from "../lib/sync/progress";
 import { emptyCursor } from "../lib/sync/types";
 import {
   advanceHighWater,
+  cursorToPersist,
   nextOffsetPage,
   paceDelayMs,
   resumeAdvanced,
   selectSyncQuery,
   shouldFullReconcile,
   splitAtHighWater,
+  tieAdvanced,
   upsertById,
 } from "../lib/sync/high-water";
 import { normalizeOrg } from "../lib/sync/rows";
@@ -83,6 +85,17 @@ describe("sync high water and upsert", () => {
     expect(nextOffsetPage(0, 50)).toBe(1);
     expect(nextOffsetPage(50, 50)).toBe(2);
     expect(nextOffsetPage(10050, 50)).toBe(202);
+    const tail = "2026-10-08T13:32:54.000Z";
+    expect(
+      cursorToPersist(tail, [
+        { id: "9", updated_at: tail },
+        { id: "10", updated_at: tail },
+      ]),
+    ).toBe(`${tail}|10`);
+    expect(cursorToPersist("opaque-2", [{ id: "10", updated_at: tail }])).toBe("opaque-2");
+    expect(tieAdvanced({ at: tail, id: "10" }, [{ id: "10", updated_at: tail }])).toBe(false);
+    expect(tieAdvanced({ at: tail, id: "10" }, [{ id: "11", updated_at: tail }])).toBe(true);
+    expect(tieAdvanced({ at: tail, id: "10" }, [{ id: "11", updated_at: "2026-10-07T00:00:00.000Z" }])).toBe(false);
     const parsed = cursorStateFromRow({
       cursor: "abc",
       page: "4",
@@ -520,42 +533,165 @@ describe("project backfill cursor", () => {
     }
   });
 
-  it("errors when the cursor and the page both return the same projects", async () => {
+  it("completes a tie when the cursor and the page both return the same projects, then starts financials", async () => {
     authEnv();
     const store = memoryStore()!;
     await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: true }));
     const seen: string[] = [];
     const original = globalThis.fetch;
-    const logged: string[] = [];
-    const errorLog = console.error;
-    console.error = (...args: unknown[]) => {
-      logged.push(args.map(String).join(" "));
-    };
     globalThis.fetch = async (input) => {
       const url = new URL(String(input));
       seen.push(url.pathname);
+      if (url.pathname.endsWith("/financials")) {
+        return Response.json({ results: { data: [{ id: "fin_1", org_id: "org_a" }], next_cursor: null } });
+      }
       if (!url.pathname.endsWith("/projects")) return Response.json({ results: { data: [], next_cursor: null } });
       return Response.json({ results: { data: tiedProjects(50), next_cursor: "2026-03-31T18:54Z" } });
     };
     try {
       const report = await runSync({ kind: "backfill", maxPages: 6 });
-      expect(report.status).toBe("error");
-      expect(report.error).toContain("did not advance");
-      expect(report.error).toContain("projects");
-      expect((await store.getCursor("projects"))?.backfillComplete).toBeFalsy();
-      expect((await store.getCursor("projects"))?.lastError).toContain("did not advance");
-      expect(backfillLabel(await store.getCursor("projects"))).toBe("Stalled");
-      expect(seen.some((path) => path.endsWith("/financials"))).toBe(false);
-      expect(logged.join(" ")).toContain("did not advance");
+      expect(report.status).toBe("ok");
+      expect(report.error).toBeNull();
+      expect(store.projects.size).toBe(50);
+      expect((await store.getCursor("projects"))?.backfillComplete).toBe(true);
+      expect((await store.getCursor("projects"))?.lastError).toBeNull();
+      expect(backfillLabel(await store.getCursor("projects"))).toBe("Complete");
+      expect(seen.some((path) => path.endsWith("/financials"))).toBe(true);
+      expect(store.financials.size).toBe(1);
       const copy = storedCopyStatus(1, {
         orgs: freshCursor({ backfillComplete: true, passComplete: true }),
         projects: await store.getCursor("projects"),
+        financials: await store.getCursor("financials"),
       });
-      expect(copy.status).toBe("backfilling");
-      expect(copy.endpoints.projects.state).toBe("in_progress");
-      expect(copy.endpoints.projects.lastError).toContain("did not advance");
+      expect(copy.endpoints.projects.state).toBe("complete");
+      expect(copy.endpoints.projects.lastError).toBeNull();
+      expect(copy.endpoints.financials.state).toBe("complete");
     } finally {
-      console.error = errorLog;
+      globalThis.fetch = original;
+    }
+  });
+
+  const TAIL = "2026-10-08T13:32:54.000Z";
+
+  it("advances past a shared updated_at with an updated_at|id cursor", async () => {
+    authEnv();
+    const store = memoryStore()!;
+    await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: true }));
+    const rows = Array.from({ length: 120 }, (_, index) => ({
+      id: String(index + 1),
+      org_id: "org_a",
+      updated_at: TAIL,
+    }));
+    const cursors: Array<string | null> = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/financials")) {
+        return Response.json({ results: { data: [{ id: "fin_1", org_id: "org_a" }], next_cursor: null } });
+      }
+      if (!url.pathname.endsWith("/projects")) return Response.json({ results: { data: [], next_cursor: null } });
+      const cursor = url.searchParams.get("cursor");
+      cursors.push(cursor);
+      let start = 0;
+      if (cursor?.includes("|")) {
+        const id = cursor.slice(cursor.lastIndexOf("|") + 1);
+        const found = rows.findIndex((row) => row.id === id);
+        start = found >= 0 ? found + 1 : 0;
+      }
+      const slice = rows.slice(start, start + 50);
+      const next = start + 50 < rows.length ? TAIL : null;
+      return Response.json({ results: { data: slice, next_cursor: next } });
+    };
+    try {
+      const report = await runSync({ kind: "backfill", maxPages: 6 });
+      expect(report.status).toBe("ok");
+      expect(report.error).toBeNull();
+      expect(cursors.some((cursor) => cursor?.startsWith(`${TAIL}|`))).toBe(true);
+      expect(store.projects.size).toBe(120);
+      expect((await store.getCursor("projects"))?.highWater).toBe(TAIL);
+      expect((await store.getCursor("projects"))?.backfillComplete).toBe(true);
+      expect(store.financials.size).toBe(1);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("walks by page when the API rejects an updated_at|id cursor", async () => {
+    authEnv();
+    const store = memoryStore()!;
+    await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: true }));
+    const rows = tiedProjects(60);
+    const requests: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/financials")) {
+        return Response.json({ results: { data: [{ id: "fin_1" }], next_cursor: null } });
+      }
+      if (!url.pathname.endsWith("/projects")) return Response.json({ results: { data: [], next_cursor: null } });
+      requests.push(url.search);
+      if (url.searchParams.get("cursor")?.includes("|")) {
+        return Response.json({ message: "The cursor field is invalid." }, { status: 422 });
+      }
+      const page = url.searchParams.get("page");
+      if (page) {
+        const start = (Number(page) - 1) * 50;
+        const slice = rows.slice(start, start + 50);
+        const next = start + 50 < rows.length ? TIE : null;
+        return Response.json({ results: { data: slice, next_cursor: next } });
+      }
+      return Response.json({ results: { data: rows.slice(0, 50), next_cursor: TIE } });
+    };
+    try {
+      const report = await runSync({ kind: "backfill", maxPages: 6 });
+      expect(report.status).toBe("ok");
+      expect(report.error).toBeNull();
+      expect(requests.some((query) => query.includes("page=2"))).toBe(true);
+      expect(store.projects.size).toBe(60);
+      expect((await store.getCursor("projects"))?.backfillComplete).toBe(true);
+      expect(store.financials.size).toBe(1);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("completes the tail when next_cursor resets onto stored rows and does not block the lists behind it", async () => {
+    authEnv();
+    const store = memoryStore()!;
+    await store.saveCursor("orgs", freshCursor({ backfillComplete: true, passComplete: true }));
+    const seen: string[] = [];
+    let projectCalls = 0;
+    let financialCalls = 0;
+    const original = globalThis.fetch;
+    const repeat = (token: string) => Response.json({ results: { data: tiedProjects(50), next_cursor: token } });
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      seen.push(url.pathname);
+      if (url.pathname.endsWith("/projects")) {
+        projectCalls += 1;
+        // A new token each time, so a string compare looks like progress, but the rows do not move.
+        return repeat(`wrap-${projectCalls}`);
+      }
+      if (url.pathname.endsWith("/financials")) {
+        financialCalls += 1;
+        return repeat(`fin-${financialCalls}`);
+      }
+      if (url.pathname.endsWith("/esign-status")) {
+        return Response.json({ results: { data: [{ id: "sign_1", org_id: "org_a" }], next_cursor: null } });
+      }
+      return Response.json({ results: { data: [], next_cursor: null } });
+    };
+    try {
+      const report = await runSync({ kind: "backfill", maxPages: 8 });
+      expect(report.status).toBe("ok");
+      expect(report.error).toBeNull();
+      expect((await store.getCursor("projects"))?.backfillComplete).toBe(true);
+      expect((await store.getCursor("projects"))?.highWater).toBe(TIE);
+      expect((await store.getCursor("financials"))?.backfillComplete).toBe(true);
+      expect(seen.some((path) => path.endsWith("/financials"))).toBe(true);
+      expect(seen.some((path) => path.endsWith("/esign-status"))).toBe(true);
+      expect(store.esign.size).toBe(1);
+    } finally {
       globalThis.fetch = original;
     }
   });

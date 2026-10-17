@@ -120,6 +120,107 @@ export function cursorStallMessage(endpoint: string): string {
   return `${endpoint} cursor did not advance. The same page came back, so this run stopped instead of repeating it.`;
 }
 
+export type TieKey = { at: string; id: string };
+
+const TIMESTAMP_CURSOR = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)$/;
+
+/** A cursor that is only an updated_at instant. A composite `updated_at|id` is not. */
+export function timestampCursorMs(cursor: string | null): number | null {
+  if (!cursor) return null;
+  const value = cursor.trim();
+  if (value.length > 40 || !TIMESTAMP_CURSOR.test(value)) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function tieKeyOf(row: unknown): TieKey | null {
+  if (!row || typeof row !== "object") return null;
+  const id = (row as { id?: unknown }).id;
+  const idText =
+    typeof id === "string" && id.trim()
+      ? id.trim()
+      : typeof id === "number" && Number.isFinite(id)
+        ? String(id)
+        : null;
+  const at = rowActivityAt(row);
+  if (!idText || !at) return null;
+  return { at, id: idText };
+}
+
+function compareId(a: string, b: string): number {
+  if (/^\d+$/.test(a) && /^\d+$/.test(b)) {
+    try {
+      const delta = BigInt(a) - BigInt(b);
+      if (delta !== BigInt(0)) return delta > BigInt(0) ? 1 : -1;
+      return 0;
+    } catch {
+      // Fall through to text order when an id is not a safe integer.
+    }
+  }
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+/** Order by (updated_at, id). Equal timestamps compare by id. */
+export function compareTie(a: TieKey, b: TieKey): number {
+  const at = Date.parse(a.at) - Date.parse(b.at);
+  if (Number.isFinite(at) && at !== 0) return at;
+  return compareId(a.id, b.id);
+}
+
+/** The last row on the page that sits on the cursor's instant, or the last keyed row. */
+export function tieKeyFromPage(rows: unknown[], cursor: string | null): TieKey | null {
+  const instant = timestampCursorMs(cursor) ?? (parseTieCursor(cursor) ? Date.parse(parseTieCursor(cursor)!.at) : null);
+  let fallback: TieKey | null = null;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const key = tieKeyOf(rows[index]);
+    if (!key) continue;
+    if (instant == null || Date.parse(key.at) === instant) return key;
+    if (!fallback) fallback = key;
+  }
+  return fallback;
+}
+
+export function compositeCursor(at: string, id: string): string {
+  const ms = Date.parse(at);
+  const iso = Number.isFinite(ms) ? new Date(ms).toISOString() : at;
+  return `${iso}|${id}`;
+}
+
+export function parseTieCursor(cursor: string | null): TieKey | null {
+  if (!cursor) return null;
+  const split = cursor.indexOf("|");
+  if (split <= 0 || split === cursor.length - 1) return null;
+  const at = cursor.slice(0, split);
+  const id = cursor.slice(split + 1);
+  if (timestampCursorMs(at) == null || !id || id.includes("|")) return null;
+  return { at: new Date(timestampCursorMs(at)!).toISOString(), id };
+}
+
+/** True when any row is strictly after the composite key already consumed. */
+export function tieAdvanced(previous: TieKey | null, rows: unknown[]): boolean {
+  if (!previous) return false;
+  return rows.some((row) => {
+    const key = tieKeyOf(row);
+    return key != null && compareTie(key, previous) > 0;
+  });
+}
+
+/**
+ * Persist a timestamp watermark as `updated_at|id` so the next request can
+ * move through rows that share that instant. Opaque cursors are unchanged.
+ */
+export function cursorToPersist(returned: string | null, rows: unknown[]): string | null {
+  if (!returned) return null;
+  if (parseTieCursor(returned)) return returned;
+  const ms = timestampCursorMs(returned);
+  if (ms == null) return returned;
+  const key = tieKeyFromPage(rows, returned);
+  if (!key || Date.parse(key.at) !== ms) return returned;
+  return compositeCursor(key.at, key.id);
+}
+
 export function nextFilter(unsupported: readonly string[]): FilterParam | null {
   return FILTER_PARAMS.find((param) => !unsupported.includes(param)) ?? null;
 }
